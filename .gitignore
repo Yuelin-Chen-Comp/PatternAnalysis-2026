@@ -1,0 +1,22 @@
+# Datasets and model files must never be committed (assessment rule)
+*.nii
+*.nii.gz
+*.npy
+*.npz
+*.pth
+*.pt
+*.ckpt
+*.h5
+
+# SLURM / training logs
+*.out
+*.err
+slurm-*
+
+# Python / editor
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+.DS_Store
