@@ -1,17 +1,21 @@
-"""Tests for the pairing and patient-level split logic in dataset.py.
+"""Tests for dataset.py: pairing, patient-level splits, preprocessing.
 
 Run from the project folder:  python -m pytest tests     (or: python tests/test_dataset.py)
-They use synthetic file names only, so no dataset is needed.
+Everything uses synthetic data, so no dataset is needed.
 """
 import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import dataset  # noqa: E402
-from dataset import (Case, LeakageError, assert_no_leakage, cases_for, find_cases,  # noqa: E402
-                     load_or_create_split, pair_key, patient_id, split_patients)
+from dataset import (BLADDER, Case, FG_CLASSES, LeakageError, PROSTATE, RECTUM, Volume,  # noqa: E402
+                     assert_no_leakage, cases_for, find_cases, find_foreground,
+                     load_or_create_split, load_volume, normalise_mr, pair_key, patient_id,
+                     split_patients, to_label_array)
 
 class Skip(Exception):
     """Raised by a test that cannot run here (used when pytest is not installed)."""
@@ -137,6 +141,93 @@ def test_split_file_roundtrip_and_stale_detection():
         with_new_patient = cases + [Case("z999_week0", "Z999", Path("mr"), Path("lab"))]
         for changed in (without_patient, with_new_patient):
             assert raises(LeakageError, load_or_create_split, changed, path), "a stale split file must raise"
+
+
+# ---------------------------------------------------------------------------
+# preprocessing
+# ---------------------------------------------------------------------------
+
+def test_normalise_mr_zscores_the_nonzero_voxels():
+    rng = np.random.default_rng(0)
+    x = np.zeros((20, 20, 10), dtype=np.float32)
+    x[5:15, 5:15, 2:8] = rng.uniform(50, 250, size=(10, 10, 6))
+    y = normalise_mr(x)
+    inside = x > 0
+    assert abs(float(y[inside].mean())) < 1e-3
+    assert abs(float(y[inside].std()) - 1.0) < 1e-2
+    assert len(np.unique(y[~inside])) == 1, "the empty background must map to a single constant"
+
+
+def test_normalise_mr_clips_outliers():
+    rng = np.random.default_rng(0)
+    x = np.zeros((20, 20, 10), dtype=np.float32)
+    x[2:18, 2:18, 2:8] = rng.uniform(50, 250, size=(16, 16, 6))   # 1536 ordinary voxels
+    x[5, 5, 2:6] = 1e6                                            # 4 saturated voxels (0.26%)
+    y = normalise_mr(x)
+    # clipped, the outliers sit at the top of the ordinary range (z about 1.7); unclipped they
+    # would drag the mean and std and sit near z = 20
+    assert float(y[x > 0].max()) < 3, "saturated voxels must be clipped before the z-score"
+
+
+def test_normalise_mr_all_zero_is_safe():
+    y = normalise_mr(np.zeros((8, 8, 4)))
+    assert np.isfinite(y).all() and float(np.abs(y).max()) == 0.0
+
+
+def test_to_label_array_validates_values():
+    assert to_label_array(np.array([0.0, 1.0, 5.0])).dtype == np.uint8
+    assert raises(ValueError, to_label_array, np.array([0, 6]))
+    assert raises(ValueError, to_label_array, np.array([-1, 2]))
+
+
+def make_volume(name="b001_week0", patient="B001", shape=(32, 32, 16), seed=0):
+    rng = np.random.default_rng(seed)
+    image = rng.uniform(1, 100, size=shape).astype(np.float16)
+    label = np.zeros(shape, dtype=np.uint8)
+    label[4:28, 4:28, 2:14] = 1
+    label[10:14, 10:14, 4:8] = BLADDER
+    label[16:18, 16:18, 6:9] = RECTUM
+    label[20:22, 12:14, 6:9] = PROSTATE
+    return Volume(name, patient, image, label, (1.68, 1.68, 1.56),
+                  find_foreground(label, FG_CLASSES, name))
+
+
+def test_find_foreground_returns_voxels_of_that_class():
+    vol = make_volume()
+    for c in FG_CLASSES:
+        coords = vol.fg_coords[c]
+        assert len(coords) > 0
+        assert (vol.label[coords[:, 0], coords[:, 1], coords[:, 2]] == c).all()
+    small = find_foreground(vol.label, [1], "x", max_points=50)
+    assert len(small[1]) == 50, "large classes are subsampled to max_points"
+
+
+def test_load_volume_cache_roundtrip_and_shape_check():
+    vol = make_volume()
+    raw_image = np.asarray(vol.image, dtype=np.float32)
+    case = Case("b001_week0", "B001", Path("mr.nii.gz"), Path("lab.nii.gz"))
+    real_loader = dataset.load_nifti
+    try:
+        dataset.load_nifti = lambda p: ((raw_image, (1.68, 1.68, 1.56)) if str(p) == "mr.nii.gz"
+                                        else (vol.label.astype(np.float32), (1.68, 1.68, 1.56)))
+        with tempfile.TemporaryDirectory() as tmp:
+            first = load_volume(case, cache_dir=tmp)
+            assert any(Path(tmp).glob("*.npz"))
+            assert not any(Path(tmp).glob("*.tmp.npz")), "no half-written cache file may be left"
+
+            def must_not_read(p):
+                raise AssertionError("the second load must come from the cache")
+            dataset.load_nifti = must_not_read
+            second = load_volume(case, cache_dir=tmp)
+        assert np.array_equal(first.image, second.image) and np.array_equal(first.label, second.label)
+        assert first.spacing == second.spacing == (1.68, 1.68, 1.56)
+        assert first.image.dtype == np.float16 and first.label.dtype == np.uint8
+
+        dataset.load_nifti = lambda p: ((raw_image, (1, 1, 1)) if str(p) == "mr.nii.gz"
+                                        else (vol.label[:, :, :-1], (1, 1, 1)))
+        assert raises(ValueError, load_volume, case), "image/label shape mismatch must raise"
+    finally:
+        dataset.load_nifti = real_loader
 
 
 if __name__ == "__main__":
