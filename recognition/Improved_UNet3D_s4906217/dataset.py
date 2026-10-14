@@ -6,6 +6,7 @@ Each step is its own small function so it can be tested alone:
     split_patients   assign whole patients to train / val / test (stored as JSON)
     load_volume      read the NIfTI files, normalise the MR, validate the labels, cache
     sample_patch     cut a training patch, oversampling the rare organs
+    augment          flip / intensity changes on a patch
 
 Why patient-level splits: the study has 38 patients with 1-8 weekly volumes each, and
 the volumes of one patient are near-copies of each other. Splitting by volume (or by
@@ -54,6 +55,8 @@ FG_CLASSES = (BLADDER, RECTUM, PROSTATE)  # the rare organs that patch sampling 
 
 PREPROC_VERSION = 1      # bump when normalise_mr / label handling changes: it invalidates the cache
 CLIP_PERCENTILE = 99.5   # MR intensities above this (computed on non-zero voxels) are clipped
+LEFT_RIGHT_AXIS = None   # array axis that is left-right; set it after scripts/check_orientation.py,
+                         # None means "never flip" (a flip along the wrong axis is anatomically wrong)
 
 _PATIENT_RE = re.compile(r"^([A-Za-z]\d+)_")
 _MODALITY_RE = re.compile(r"[_-]?(lfov|semantic)$", re.IGNORECASE)
@@ -338,7 +341,7 @@ def load_volumes(cases: Sequence[Case], cache_dir=None, fg_classes: Sequence[int
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: patch sampling (numpy only)
+# Stage 2: patch sampling and augmentation (numpy only)
 # ---------------------------------------------------------------------------
 
 def crop_slices(shape: Sequence[int], patch_size: Sequence[int], rng: np.random.Generator,
@@ -380,6 +383,28 @@ def sample_patch(volume: Volume, patch_size: Sequence[int], rng: np.random.Gener
             center = tuple(int(v) for v in coords[int(rng.integers(len(coords)))])
     box = crop_slices(volume.image.shape, patch_size, rng, center)
     return volume.image[box].astype(np.float32), np.array(volume.label[box])
+
+
+def augment(image: np.ndarray, label: np.ndarray, rng: np.random.Generator,
+            flip_axis: Optional[int] = None, p_flip: float = 0.5,
+            p_intensity: float = 0.5, p_noise: float = 0.2) -> Tuple[np.ndarray, np.ndarray]:
+    """Light augmentation of one (image, label) patch; the label only ever gets the flip.
+
+    * left-right flip (only if flip_axis is given): the anatomy is roughly symmetric;
+      flipping the other axes would put the bladder behind the rectum.
+    * intensity: scale by 0.9-1.1 and shift by up to 0.1 (in z-score units), which mimics
+      the scanner-to-scanner gain differences seen between volumes.
+    * Gaussian noise with a random standard deviation up to 0.05.
+    Spatial warps (rotation, scaling) are left out for now.
+    """
+    if flip_axis is not None and rng.random() < p_flip:
+        image = np.flip(image, axis=flip_axis)
+        label = np.flip(label, axis=flip_axis)
+    if rng.random() < p_intensity:
+        image = image * rng.uniform(0.9, 1.1) + rng.uniform(-0.1, 0.1)
+    if rng.random() < p_noise:
+        image = image + rng.normal(0.0, rng.uniform(0.0, 0.05), size=image.shape)
+    return np.ascontiguousarray(image, dtype=np.float32), np.ascontiguousarray(label)
 
 
 # ---------------------------------------------------------------------------

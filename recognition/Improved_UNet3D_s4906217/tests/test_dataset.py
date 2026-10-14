@@ -1,4 +1,4 @@
-"""Tests for dataset.py: pairing, patient-level splits, preprocessing, patch sampling.
+"""Tests for dataset.py: pairing, patient-level splits, preprocessing, patch sampling, augmentation.
 
 Run from the project folder:  python -m pytest tests     (or: python tests/test_dataset.py)
 Everything uses synthetic data, so no dataset is needed.
@@ -12,8 +12,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import dataset  # noqa: E402
-from dataset import (BLADDER, Case, FG_CLASSES, LeakageError, PROSTATE, RECTUM, Volume,  # noqa: E402
-                     assert_no_leakage, cases_for, crop_slices, find_cases,
+from dataset import (BLADDER, FG_CLASSES, PROSTATE, RECTUM, Case, LeakageError, Volume,  # noqa: E402
+                     assert_no_leakage, augment, cases_for, crop_slices, find_cases,
                      find_foreground, load_or_create_split, load_volume, normalise_mr,
                      pair_key, patient_id, sample_patch, split_patients, to_label_array)
 
@@ -231,7 +231,7 @@ def test_load_volume_cache_roundtrip_and_shape_check():
 
 
 # ---------------------------------------------------------------------------
-# patch sampling
+# patch sampling and augmentation
 # ---------------------------------------------------------------------------
 
 def test_crop_slices_stay_inside_and_have_requested_size():
@@ -267,6 +267,33 @@ def test_sample_patch_oversamples_the_rare_organ():
 
     assert hit_rate(1.0) == 1.0, "with p_foreground=1 every patch must contain the prostate"
     assert hit_rate(0.0) < 0.6, "uniform patches should often miss a 12-voxel organ"
+
+
+def test_augment_keeps_image_and_label_aligned_under_a_flip():
+    rng = np.random.default_rng(0)
+    label = (np.arange(8 * 8 * 8).reshape(8, 8, 8) % 6).astype(np.uint8)
+    image = label.astype(np.float32)
+    out_image, out_label = augment(image, label, rng, flip_axis=0, p_flip=1.0, p_intensity=0.0, p_noise=0.0)
+    assert np.array_equal(out_label, label[::-1])
+    assert np.array_equal(out_image, out_label.astype(np.float32)), "image and label must flip together"
+
+
+def test_augment_never_flips_without_an_axis():
+    rng = np.random.default_rng(0)
+    label = (np.arange(512).reshape(8, 8, 8) % 6).astype(np.uint8)
+    out_image, out_label = augment(label.astype(np.float32), label, rng,
+                                   flip_axis=None, p_flip=1.0, p_intensity=0.0, p_noise=0.0)
+    assert np.array_equal(out_label, label)
+
+
+def test_augment_changes_intensities_but_never_labels():
+    rng = np.random.default_rng(0)
+    label = (np.arange(512).reshape(8, 8, 8) % 6).astype(np.uint8)
+    image = np.ones((8, 8, 8), dtype=np.float32)
+    out_image, out_label = augment(image, label, rng, flip_axis=None, p_intensity=1.0, p_noise=1.0)
+    assert out_image.dtype == np.float32 and out_image.shape == image.shape
+    assert not np.array_equal(out_image, image)
+    assert np.array_equal(out_label, label)
 
 
 if __name__ == "__main__":
