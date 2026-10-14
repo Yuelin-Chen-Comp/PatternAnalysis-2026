@@ -96,8 +96,10 @@ most 41 slices) with AMP and sliding-window inference. Peak VRAM and parameter c
 | Rangpur queue contention near the deadline | Submit early; use `--partition=comp3710 --account=comp3710` |
 
 - **Budget:** about 10 GPU-hours on one A100 (2D baseline about 1 h; 3D model about 3-4 h per run, 2-3 runs).
-- **Done:** corrected data audit; `dataset.py` with pairing, patient-level split and leakage check (with tests).
-- **Next experiment (by 19 Oct check-off):** preprocessing and patch sampler, a 2D baseline smoke test, and a 3D VRAM
-  measurement (one forward/backward pass).
+- **Done:** corrected data audit; `dataset.py` with pairing, patient-level split and leakage check, preprocessing
+  (clip + z-score), cached loading, patch sampler with rare-organ oversampling, augmentation and torch Datasets
+  (26 unit tests, checked by deliberately breaking the code).
+- **Next experiment (by 19 Oct check-off):** confirm the left-right axis (`scripts/check_orientation.py`), a 2D
+  baseline smoke test, and a 3D VRAM measurement (one forward/backward pass).
 - **Fallback:** if the Improved U-Net does not fit memory or cannot reach Dice 0.7, fall back to a plain 3D
   U-Net (Normal difficulty, capped at 15/20) with patch training. It still answers the dilemma against the 2D baseline.
