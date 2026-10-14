@@ -1,4 +1,4 @@
-"""Tests for dataset.py: pairing, patient-level splits, preprocessing.
+"""Tests for dataset.py: pairing, patient-level splits, preprocessing, patch sampling.
 
 Run from the project folder:  python -m pytest tests     (or: python tests/test_dataset.py)
 Everything uses synthetic data, so no dataset is needed.
@@ -13,9 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import dataset  # noqa: E402
 from dataset import (BLADDER, Case, FG_CLASSES, LeakageError, PROSTATE, RECTUM, Volume,  # noqa: E402
-                     assert_no_leakage, cases_for, find_cases, find_foreground,
-                     load_or_create_split, load_volume, normalise_mr, pair_key, patient_id,
-                     split_patients, to_label_array)
+                     assert_no_leakage, cases_for, crop_slices, find_cases,
+                     find_foreground, load_or_create_split, load_volume, normalise_mr,
+                     pair_key, patient_id, sample_patch, split_patients, to_label_array)
 
 class Skip(Exception):
     """Raised by a test that cannot run here (used when pytest is not installed)."""
@@ -228,6 +228,45 @@ def test_load_volume_cache_roundtrip_and_shape_check():
         assert raises(ValueError, load_volume, case), "image/label shape mismatch must raise"
     finally:
         dataset.load_nifti = real_loader
+
+
+# ---------------------------------------------------------------------------
+# patch sampling
+# ---------------------------------------------------------------------------
+
+def test_crop_slices_stay_inside_and_have_requested_size():
+    rng = np.random.default_rng(0)
+    shape, patch = (32, 32, 16), (8, 8, 8)
+    centers = [None, (0, 0, 0), (31, 31, 15), (16, 16, 8), (5, 30, 2)]
+    for center in centers:
+        for _ in range(50):
+            box = crop_slices(shape, patch, rng, center)
+            for sl, dim, size in zip(box, shape, patch):
+                assert sl.stop - sl.start == size and 0 <= sl.start and sl.stop <= dim
+
+
+def test_crop_slices_rejects_a_patch_larger_than_the_volume():
+    assert raises(ValueError, crop_slices, (8, 8, 8), (16, 8, 8), np.random.default_rng(0))
+
+
+def test_sample_patch_shapes_and_dtypes():
+    vol = make_volume()
+    image, label = sample_patch(vol, (8, 8, 8), np.random.default_rng(0))
+    assert image.shape == label.shape == (8, 8, 8)
+    assert image.dtype == np.float32 and label.dtype == np.uint8
+
+
+def test_sample_patch_oversamples_the_rare_organ():
+    vol = make_volume()
+    rng = np.random.default_rng(1)
+
+    def hit_rate(p):
+        hits = sum(bool((sample_patch(vol, (8, 8, 8), rng, p, fg_classes=(PROSTATE,))[1] == PROSTATE).any())
+                   for _ in range(300))
+        return hits / 300
+
+    assert hit_rate(1.0) == 1.0, "with p_foreground=1 every patch must contain the prostate"
+    assert hit_rate(0.0) < 0.6, "uniform patches should often miss a 12-voxel organ"
 
 
 if __name__ == "__main__":

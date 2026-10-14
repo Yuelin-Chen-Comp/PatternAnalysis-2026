@@ -5,6 +5,7 @@ Each step is its own small function so it can be tested alone:
     find_cases       pair every MR volume with its label volume
     split_patients   assign whole patients to train / val / test (stored as JSON)
     load_volume      read the NIfTI files, normalise the MR, validate the labels, cache
+    sample_patch     cut a training patch, oversampling the rare organs
 
 Why patient-level splits: the study has 38 patients with 1-8 weekly volumes each, and
 the volumes of one patient are near-copies of each other. Splitting by volume (or by
@@ -334,6 +335,51 @@ def load_volumes(cases: Sequence[Case], cache_dir=None, fg_classes: Sequence[int
         if verbose and (i % 20 == 0 or i == len(cases)):
             print(f"  loaded {i}/{len(cases)} volumes", flush=True)
     return volumes
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: patch sampling (numpy only)
+# ---------------------------------------------------------------------------
+
+def crop_slices(shape: Sequence[int], patch_size: Sequence[int], rng: np.random.Generator,
+                center: Optional[Sequence[int]] = None) -> Tuple[slice, ...]:
+    """Slices of a patch that lies fully inside `shape`.
+
+    Without a centre the patch position is uniform. With a centre the patch is placed
+    around it, shifted by a random jitter of up to a quarter of the patch size per axis
+    so the organ is not always in the middle, and then clamped to stay inside.
+    """
+    slices = []
+    for axis, (dim, size) in enumerate(zip(shape, patch_size)):
+        if size > dim:
+            raise ValueError(f"patch size {tuple(patch_size)} does not fit in volume {tuple(shape)}")
+        if center is None:
+            start = int(rng.integers(0, dim - size + 1))
+        else:
+            jitter = int(rng.integers(-(size // 4), size // 4 + 1))
+            start = int(np.clip(center[axis] - size // 2 + jitter, 0, dim - size))
+        slices.append(slice(start, start + size))
+    return tuple(slices)
+
+
+def sample_patch(volume: Volume, patch_size: Sequence[int], rng: np.random.Generator,
+                 p_foreground: float = 0.5,
+                 fg_classes: Sequence[int] = FG_CLASSES) -> Tuple[np.ndarray, np.ndarray]:
+    """Cut one training patch (image float32, label uint8).
+
+    The prostate is only 0.10% of the voxels, so uniform patches often miss it. With
+    probability p_foreground the patch is centred on a random voxel of a randomly chosen
+    rare class (bladder, rectum or prostate); otherwise its position is uniform. The
+    uniform patches keep the background and the other tissue in the training signal.
+    """
+    center = None
+    if rng.random() < p_foreground:
+        available = [c for c in fg_classes if len(volume.fg_coords.get(c, ())) > 0]
+        if available:
+            coords = volume.fg_coords[available[int(rng.integers(len(available)))]]
+            center = tuple(int(v) for v in coords[int(rng.integers(len(coords)))])
+    box = crop_slices(volume.image.shape, patch_size, rng, center)
+    return volume.image[box].astype(np.float32), np.array(volume.label[box])
 
 
 # ---------------------------------------------------------------------------
