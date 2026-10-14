@@ -13,6 +13,21 @@ import dataset  # noqa: E402
 from dataset import (Case, LeakageError, assert_no_leakage, cases_for, find_cases,  # noqa: E402
                      load_or_create_split, pair_key, patient_id, split_patients)
 
+class Skip(Exception):
+    """Raised by a test that cannot run here (used when pytest is not installed)."""
+
+
+def raises(exc, fn, *args, **kwargs):
+    try:
+        fn(*args, **kwargs)
+    except exc:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# pairing and splits
+# ---------------------------------------------------------------------------
 
 def make_dataset(root: Path, volumes, drop_label=None):
     """Create empty MR/label files named like the real study."""
@@ -40,11 +55,7 @@ def test_patient_id():
     assert patient_id("b006_Week1_SEMANTIC.nii.gz") == "B006"
     assert patient_id("J005_Week0_LFOV.nii.gz") == "J005"
     for bad in ("case_004_week_0_slice_0.nii.gz", "volume.nii.gz", ""):
-        try:
-            patient_id(bad)
-        except ValueError:
-            continue
-        raise AssertionError(f"{bad!r} should not parse")
+        assert raises(ValueError, patient_id, bad), f"{bad!r} should not parse"
 
 
 def test_pair_key_matches_mr_and_label():
@@ -102,22 +113,14 @@ def test_leakage_is_detected():
     cases = fake_cases(10)
     split = split_patients([c.patient for c in cases])
     split["val"].append(split["train"][0])
-    try:
-        assert_no_leakage(split, cases)
-    except LeakageError:
-        return
-    raise AssertionError("a patient in train and val must raise LeakageError")
+    assert raises(LeakageError, assert_no_leakage, split, cases)
 
 
 def test_incomplete_split_is_detected():
     cases = fake_cases(10)
     split = split_patients([c.patient for c in cases])
     split["train"].pop()
-    try:
-        assert_no_leakage(split, cases)
-    except LeakageError:
-        return
-    raise AssertionError("an unassigned patient must raise LeakageError")
+    assert raises(LeakageError, assert_no_leakage, split, cases)
 
 
 def test_split_file_roundtrip_and_stale_detection():
@@ -133,16 +136,18 @@ def test_split_file_roundtrip_and_stale_detection():
         without_patient = [c for c in cases if c.patient != victim]
         with_new_patient = cases + [Case("z999_week0", "Z999", Path("mr"), Path("lab"))]
         for changed in (without_patient, with_new_patient):
-            try:
-                load_or_create_split(changed, path)
-            except LeakageError:
-                continue
-            raise AssertionError("a stale split file must raise")
+            assert raises(LeakageError, load_or_create_split, changed, path), "a stale split file must raise"
 
 
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
+    skipped = 0
     for name, fn in tests:
-        fn()
-        print(f"ok  {name}")
-    print(f"{len(tests)} tests passed")
+        try:
+            fn()
+        except Skip as why:
+            skipped += 1
+            print(f"skip {name} ({why})")
+        else:
+            print(f"ok   {name}")
+    print(f"{len(tests) - skipped} passed, {skipped} skipped")
