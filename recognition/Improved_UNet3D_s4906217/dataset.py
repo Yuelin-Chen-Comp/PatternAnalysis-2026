@@ -7,6 +7,7 @@ Each step is its own small function so it can be tested alone:
     load_volume      read the NIfTI files, normalise the MR, validate the labels, cache
     sample_patch     cut a training patch, oversampling the rare organs
     augment          flip / intensity changes on a patch
+    *Dataset         thin torch wrappers around the functions above
 
 Why patient-level splits: the study has 38 patients with 1-8 weekly volumes each, and
 the volumes of one patient are near-copies of each other. Splitting by volume (or by
@@ -40,6 +41,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+try:  # torch is only needed by the Dataset classes; every helper also works without it
+    import torch
+    from torch.utils.data import Dataset
+except ImportError:  # pragma: no cover
+    torch = None
+    Dataset = object
+
 DEFAULT_ROOT = "/home/groups/comp3710/HipMRI_Study_open"
 MR_DIR = "semantic_MRs"
 LABEL_DIR = "semantic_labels_only"
@@ -53,6 +61,7 @@ CLASS_NAMES = ("background", "body", "bone", "bladder", "rectum", "prostate")
 BLADDER, RECTUM, PROSTATE = 3, 4, 5
 FG_CLASSES = (BLADDER, RECTUM, PROSTATE)  # the rare organs that patch sampling oversamples
 
+DEFAULT_PATCH = (128, 128, 64)
 PREPROC_VERSION = 1      # bump when normalise_mr / label handling changes: it invalidates the cache
 CLIP_PERCENTILE = 99.5   # MR intensities above this (computed on non-zero voxels) are clipped
 LEFT_RIGHT_AXIS = None   # array axis that is left-right; set it after scripts/check_orientation.py,
@@ -405,6 +414,105 @@ def augment(image: np.ndarray, label: np.ndarray, rng: np.random.Generator,
     if rng.random() < p_noise:
         image = image + rng.normal(0.0, rng.uniform(0.0, 0.05), size=image.shape)
     return np.ascontiguousarray(image, dtype=np.float32), np.ascontiguousarray(label)
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: torch Datasets (thin wrappers)
+# ---------------------------------------------------------------------------
+
+class HipMRIPatchDataset(Dataset):
+    """Training data: random 3D patches. One 'epoch' is `samples_per_epoch` random draws.
+
+    balance_patients: pick a patient uniformly, then one of its volumes. Otherwise a
+    patient with 8 weekly scans would be drawn 8 times as often as one with a single scan,
+    and the model would fit the frequently scanned patients best.
+    """
+
+    def __init__(self, volumes: Sequence[Volume], patch_size: Sequence[int] = DEFAULT_PATCH,
+                 samples_per_epoch: int = 250, p_foreground: float = 0.5,
+                 fg_classes: Sequence[int] = FG_CLASSES, balance_patients: bool = True,
+                 augment_data: bool = True):
+        if not volumes:
+            raise ValueError("no volumes given")
+        self.volumes = list(volumes)
+        self.patch_size = tuple(patch_size)
+        self.samples_per_epoch = samples_per_epoch
+        self.p_foreground = p_foreground
+        self.fg_classes = tuple(fg_classes)
+        self.balance_patients = balance_patients
+        self.augment_data = augment_data
+        self.by_patient: Dict[str, List[int]] = {}
+        for i, v in enumerate(self.volumes):
+            self.by_patient.setdefault(v.patient, []).append(i)
+        self.patients = sorted(self.by_patient)
+        self._rng = None
+
+    def __len__(self) -> int:
+        return self.samples_per_epoch
+
+    def _get_rng(self) -> np.random.Generator:
+        # created lazily inside each DataLoader worker from that worker's torch seed, so
+        # workers draw different patches (and torch.manual_seed makes a run reproducible)
+        if self._rng is None:
+            self._rng = np.random.default_rng(torch.initial_seed() % (2 ** 32))
+        return self._rng
+
+    def _pick_volume(self, rng: np.random.Generator) -> Volume:
+        if self.balance_patients:
+            idxs = self.by_patient[self.patients[int(rng.integers(len(self.patients)))]]
+            return self.volumes[idxs[int(rng.integers(len(idxs)))]]
+        return self.volumes[int(rng.integers(len(self.volumes)))]
+
+    def __getitem__(self, index: int):
+        rng = self._get_rng()  # the index is ignored: every draw is random
+        image, label = sample_patch(self._pick_volume(rng), self.patch_size, rng,
+                                    self.p_foreground, self.fg_classes)
+        if self.augment_data:
+            image, label = augment(image, label, rng, flip_axis=LEFT_RIGHT_AXIS)
+        return {"image": torch.from_numpy(image).unsqueeze(0),
+                "label": torch.from_numpy(label.astype(np.int64))}
+
+
+class HipMRIVolumeDataset(Dataset):
+    """Validation / test data: whole volumes, no randomness. Use batch_size=1 (the volumes
+    differ in depth: one has 144 slices) and sliding-window inference on the result."""
+
+    def __init__(self, volumes: Sequence[Volume]):
+        self.volumes = list(volumes)
+
+    def __len__(self) -> int:
+        return len(self.volumes)
+
+    def __getitem__(self, index: int):
+        v = self.volumes[index]
+        return {"image": torch.from_numpy(v.image.astype(np.float32)).unsqueeze(0),
+                "label": torch.from_numpy(v.label.astype(np.int64)),
+                "name": v.name, "patient": v.patient,
+                "spacing": torch.tensor(v.spacing, dtype=torch.float32)}
+
+
+def make_datasets(root=DEFAULT_ROOT, split_file=DEFAULT_SPLIT_FILE, which: Sequence[str] = ("train", "val"),
+                  patch_size: Sequence[int] = DEFAULT_PATCH, samples_per_epoch: int = 250,
+                  cache_dir=None, max_cases_per_split: Optional[int] = None, **patch_kwargs):
+    """Build the requested datasets from the stored patient split.
+
+    `which` defaults to train and val: the test set should only be built (which=("test",))
+    for the final evaluation. max_cases_per_split limits the volumes for quick smoke tests.
+    """
+    cases = find_cases(root)
+    split = load_or_create_split(cases, split_file)
+    datasets = {}
+    for name in which:
+        if name not in SPLIT_NAMES:
+            raise ValueError(f"unknown split {name!r}")
+        subset = cases_for(cases, split, name)
+        if max_cases_per_split:
+            subset = subset[:max_cases_per_split]
+        print(f"{name}: {len(subset)} volumes from {len({c.patient for c in subset})} patients")
+        volumes = load_volumes(subset, cache_dir, FG_CLASSES if name == "train" else ())
+        datasets[name] = (HipMRIPatchDataset(volumes, patch_size, samples_per_epoch, **patch_kwargs)
+                          if name == "train" else HipMRIVolumeDataset(volumes))
+    return datasets
 
 
 # ---------------------------------------------------------------------------

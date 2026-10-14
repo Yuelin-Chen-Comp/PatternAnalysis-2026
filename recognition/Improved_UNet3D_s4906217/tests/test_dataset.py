@@ -1,7 +1,8 @@
 """Tests for dataset.py: pairing, patient-level splits, preprocessing, patch sampling, augmentation.
 
 Run from the project folder:  python -m pytest tests     (or: python tests/test_dataset.py)
-Everything uses synthetic data, so no dataset is needed.
+Everything uses synthetic data, so no dataset is needed. The torch wrapper tests are
+skipped when torch is not installed.
 """
 import sys
 import tempfile
@@ -17,8 +18,21 @@ from dataset import (BLADDER, FG_CLASSES, PROSTATE, RECTUM, Case, LeakageError, 
                      find_foreground, load_or_create_split, load_volume, normalise_mr,
                      pair_key, patient_id, sample_patch, split_patients, to_label_array)
 
+HAS_TORCH = dataset.torch is not None
+
+
 class Skip(Exception):
     """Raised by a test that cannot run here (used when pytest is not installed)."""
+
+
+def need_torch():
+    if HAS_TORCH:
+        return
+    try:
+        import pytest
+    except ImportError:
+        raise Skip("torch not installed")
+    pytest.skip("torch not installed")
 
 
 def raises(exc, fn, *args, **kwargs):
@@ -294,6 +308,39 @@ def test_augment_changes_intensities_but_never_labels():
     assert out_image.dtype == np.float32 and out_image.shape == image.shape
     assert not np.array_equal(out_image, image)
     assert np.array_equal(out_label, label)
+
+
+# ---------------------------------------------------------------------------
+# torch wrappers (skipped without torch)
+# ---------------------------------------------------------------------------
+
+def test_patch_dataset_items():
+    need_torch()
+    ds = dataset.HipMRIPatchDataset([make_volume()], patch_size=(8, 8, 8), samples_per_epoch=5)
+    assert len(ds) == 5
+    item = ds[0]
+    assert tuple(item["image"].shape) == (1, 8, 8, 8) and tuple(item["label"].shape) == (8, 8, 8)
+    assert "float32" in str(item["image"].dtype) and "int64" in str(item["label"].dtype)
+    assert not np.array_equal(np.asarray(ds[0]["image"]), np.asarray(ds[1]["image"])), "draws must differ"
+
+
+def test_patient_balanced_sampling():  # the sampling logic itself needs no torch
+    volumes = [make_volume("a_week0", "A")] + [make_volume(f"b_week{i}", "B") for i in range(7)]
+    rng = np.random.default_rng(0)
+    for balance, expected in ((True, 0.5), (False, 1 / 8)):
+        ds = dataset.HipMRIPatchDataset(volumes, patch_size=(8, 8, 8), balance_patients=balance)
+        share_a = np.mean([ds._pick_volume(rng).patient == "A" for _ in range(4000)])
+        assert abs(share_a - expected) < 0.04, f"balance={balance}: share of patient A was {share_a:.3f}"
+
+
+def test_volume_dataset_items():
+    need_torch()
+    ds = dataset.HipMRIVolumeDataset([make_volume(), make_volume("b002_week0", "B002")])
+    assert len(ds) == 2
+    item = ds[1]
+    assert tuple(item["image"].shape) == (1, 32, 32, 16) and tuple(item["label"].shape) == (32, 32, 16)
+    assert item["name"] == "b002_week0" and item["patient"] == "B002"
+    assert tuple(item["spacing"].shape) == (3,)
 
 
 if __name__ == "__main__":
