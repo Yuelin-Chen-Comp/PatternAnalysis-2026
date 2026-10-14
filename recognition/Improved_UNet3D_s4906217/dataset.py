@@ -27,6 +27,7 @@ Conventions
 
 Usage:
     python dataset.py --root /home/groups/comp3710/HipMRI_Study_open            # split summary
+    python dataset.py --check-load --cache-dir $HOME/hipmri_cache               # + load one volume
 """
 from __future__ import annotations
 
@@ -519,11 +520,31 @@ def make_datasets(root=DEFAULT_ROOT, split_file=DEFAULT_SPLIT_FILE, which: Seque
 # Command line
 # ---------------------------------------------------------------------------
 
+def _smoke_check(cases: Sequence[Case], split: Dict[str, List[str]], cache_dir) -> None:
+    """Load one validation volume and print what the training pipeline will see."""
+    case = cases_for(cases, split, "val")[0]
+    print(f"\nSmoke check on validation volume {case.name}")
+    vol = load_volume(case, cache_dir)
+    img = vol.image.astype(np.float32)
+    print(f"  shape={vol.image.shape} spacing={vol.spacing}")
+    print(f"  normalised image: min={img.min():.2f} max={img.max():.2f} mean={img.mean():.2f} "
+          f"std={img.std():.2f}; {100 * (img == img.min()).mean():.1f}% of voxels are background")
+    counts = np.bincount(vol.label.ravel(), minlength=NUM_CLASSES)
+    print("  label voxels: " + ", ".join(f"{CLASS_NAMES[i]}={100 * counts[i] / counts.sum():.2f}%"
+                                         for i in range(NUM_CLASSES)))
+    rng = np.random.default_rng(0)
+    for p in (0.0, 0.5):
+        hits = sum(bool((sample_patch(vol, DEFAULT_PATCH, rng, p)[1] == PROSTATE).any()) for _ in range(200))
+        print(f"  p_foreground={p}: {hits / 200:.0%} of 200 patches {DEFAULT_PATCH} contain prostate")
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Pair HipMRI volumes and build the patient-level split.")
+    ap = argparse.ArgumentParser(description="Pair HipMRI volumes, build the patient-level split.")
     ap.add_argument("--root", default=DEFAULT_ROOT)
     ap.add_argument("--split-file", default=str(DEFAULT_SPLIT_FILE))
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--check-load", action="store_true", help="also load one val volume and sample patches")
+    ap.add_argument("--cache-dir", default=None, help="folder for preprocessed .npz files (not in git)")
     args = ap.parse_args()
 
     cases = find_cases(args.root)
@@ -534,6 +555,8 @@ def main() -> None:
         print(f"  {name:5s}: {len(split[name]):2d} patients, {len(subset):3d} volumes  {split[name]}")
     print("No patient appears in more than one split: OK")
     print(f"Split file: {args.split_file}")
+    if args.check_load:
+        _smoke_check(cases, split, args.cache_dir)
 
 
 if __name__ == "__main__":
