@@ -70,19 +70,57 @@ volumes.
 | Median first-last slice index (last axis) | bladder [72, 107], prostate [53, 79], rectum [46, 96] |
 | Provided 2D splits (train / validate / test) | 31 / 4 / 3 patients, 0 shared (the first run's "1 shared" for `seg_` folders was a filename-parsing artifact); the 38 case numbers equal the 38 numeric parts of the 3D ids |
 
-Anatomical sanity check: the bladder sits on one side of the prostate along the last axis and the rectum overlaps
-both, as expected. This supports the inferred label order and suggests the last axis is the superior-inferior axis
-(to be confirmed with an overlay plot).
+Orientation check ([`scripts/check_orientation.py`](scripts/check_orientation.py), Rangpur job 662280, 40 label
+volumes evenly spaced over the sorted file list). The NIfTI affine gives the axis codes (L, P, S) for all 40 volumes,
+and the anatomy agrees with it:
+
+| Offset between organ centroids (voxels, mean +- std over 40 volumes; share of volumes > 0) | axis 0 | axis 1 | axis 2 |
+|---|---|---|---|
+| rectum - prostate | +0.1 +- 1.2 (55%) | +25.3 +- 2.7 (100%) | +8.2 +- 5.3 (98%) |
+| bladder - prostate | +0.1 +- 1.7 (50%) | -15.3 +- 6.5 (2%) | +21.7 +- 4.9 (100%) |
+
+Axis 0 shows no consistent offset, so it is left-right. Axis 1 is anterior-posterior (the rectum lies behind the
+prostate, the bladder in front of it; higher index = posterior). Axis 2 is superior-inferior (the bladder lies above
+the prostate; higher index = superior, so the prostate base is its higher-index end). The last axis, which is the
+slice axis of the 2D baseline, is therefore superior-inferior. Flip augmentation is applied along axis 0 only
+(`LEFT_RIGHT_AXIS = 0` in `dataset.py`). That the bladder (label 3) sits above and in front of the prostate and the
+rectum (label 4) behind it supports the inferred label order; an overlay plot is still to be made.
 
 Patient-level split (seed 42, stored in [`splits/split_seed42.json`](splits/split_seed42.json)): 26 train / 6
 validation / 6 test patients. All volumes of a patient stay in one split, and `dataset.py` raises if any patient
 appears in two splits or the stored split no longer matches the data.
 
-Resource estimate: one volume is 256 x 256 x 128 = 8.4 M voxels, so a single 16-channel float32 feature map at full
-resolution is already 0.54 GB and the network keeps many of them for backpropagation. Whole-volume training is
-therefore likely to need tens of GB, so the plan is patch-based training (for example 128 x 128 x 64; the prostate spans at
-most 41 slices) with AMP and sliding-window inference. Peak VRAM and parameter count:
-⟨TODO: measure one forward + backward pass, batch 1, AMP, on a Rangpur GPU via `torch.cuda.max_memory_allocated`⟩.
+Resource profile ([`scripts/measure_vram.py`](scripts/measure_vram.py), Rangpur job 662279). GPU: NVIDIA
+A100-PCIE-40GB (39.5 GiB usable); PyTorch 2.13.0+cu130 (CUDA 13.0, cuDNN 9.20); random tensors, so no data is needed.
+A training step is forward + a cross-entropy + soft-Dice stand-in loss + backward + one AdamW step, and its peak counts
+the weights, gradients and optimiser states. bf16 autocast unless stated, `cudnn.benchmark` off, time is the median of
+5 steps after one warm-up. `UNet3D` uses 16 base channels, `UNet2D` 32.
+
+| Configuration | Input | Batch | Params (M) | Peak allocated (GiB) | Peak reserved (GiB) | Time per step / call (s) |
+|---|---|---|---|---|---|---|
+| 3D train, patch, bf16 | 128x128x64 | 1 | 5.65 | 0.68 | 0.92 | 0.056 |
+| 3D train, patch, bf16 | 128x128x64 | 2 | 5.65 | 1.29 | 1.80 | 0.050 |
+| 3D train, patch, fp32 | 128x128x64 | 1 | 5.65 | 1.19 | 1.27 | 0.038 |
+| 3D train, whole volume, bf16 | 256x256x128 | 1 | 5.65 | 4.93 | 6.99 | 0.270 |
+| 2D train, slices, bf16 | 256x256 | 16 | 7.76 | 1.70 | 1.93 | 0.033 |
+| 2D train, slices, bf16 | 256x256 | 32 | 7.76 | 3.30 | 3.78 | 0.061 |
+| 3D inference, patch, bf16 | 128x128x64 | 1 | 5.65 | 0.28 | 0.34 | 0.014 |
+| 3D inference, whole volume, bf16 | 256x256x128 | 1 | 5.65 | 2.11 | 2.36 | 0.111 |
+| 2D inference, whole volume slice by slice, bf16 | 256x256x128 | 1 | 7.76 | 1.19 | 1.52 | 0.077 |
+
+Reading the table:
+- Everything fits with a wide margin. My earlier estimate that whole-volume training would need tens of GB was wrong
+  for this model: a whole 256 x 256 x 128 volume trains in 4.93 GiB. Memory is therefore not what forces
+  patch-based training. Patches remain the default because the sampler can oversample the prostate (0.10% of the
+  voxels) and a patch step is about 5x faster (0.056 s against 0.270 s); whole-volume training is feasible and stays
+  available as a comparison. The headroom (4.9 of 39.5 GiB) also leaves room for the extra width, residual units and
+  deep-supervision outputs of the Improved U-Net, which will be measured again once it exists.
+- For inference on a whole volume, the 3D U-Net needs about 1.5x the time and 1.8x the peak memory of the 2D baseline
+  run slice by slice. That is far from the 5-10x that the open question warns about, but it compares untrained models
+  of unequal capacity (7.76 M against 5.65 M parameters), so it is a first data point and not the answer. Training
+  time to a given Dice will be compared from the real runs.
+- The step times are rough: batch 2 took no longer than batch 1, which suggests that a single patch does not saturate
+  the GPU and that overhead and noise matter at this size.
 
 ### 4. Risks, budget and fallback
 
@@ -91,15 +129,17 @@ most 41 slices) with AMP and sliding-window inference. Peak VRAM and parameter c
 | Only 38 patients, so the test set is about 6-8 patients and results are noisy | Report per-patient Dice distributions, not just the mean; use more than one seed; k-fold if time allows |
 | Prostate is only 0.10% of voxels (about 26 slices per volume) | Dice + CE loss; oversample foreground patches |
 | In-plane spacing varies (1.41-1.88 mm); one volume (K019_Week1) has 144 slices | No resampling, reported as a limitation; patch training and sliding-window inference accept any depth; per-volume spacing for any distance metric |
-| 3D memory | Downsampled data, patch-based training, AMP, batch size 1-2 |
+| 3D memory | Measured (see the resource profile): 0.68 GiB per 128x128x64 patch and 4.93 GiB per whole volume on a 39.5 GiB A100, so low risk; re-measure after the Improved U-Net's residual units and deep supervision are added |
 | Label/MR misalignment or naming mismatch | Checked by the audit (211 / 211 paired, 0 shape or affine mismatches); `dataset.py` raises on any unpaired file |
 | Rangpur queue contention near the deadline | Submit early; use `--partition=comp3710 --account=comp3710` |
 
 - **Budget:** about 10 GPU-hours on one A100 (2D baseline about 1 h; 3D model about 3-4 h per run, 2-3 runs).
 - **Done:** corrected data audit; `dataset.py` with pairing, patient-level split and leakage check, preprocessing
   (clip + z-score), cached loading, patch sampler with rare-organ oversampling, augmentation and torch Datasets
-  (26 unit tests, checked by deliberately breaking the code).
-- **Next experiment (by 19 Oct check-off):** confirm the left-right axis (`scripts/check_orientation.py`), a 2D
-  baseline smoke test, and a 3D VRAM measurement (one forward/backward pass).
+  (26 unit tests, checked by deliberately breaking the code); `modules.py` with the 2D U-Net baseline, a plain 3D
+  U-Net and the slice-by-slice wrapper for the baseline (13 unit tests); left-right axis confirmed
+  (`LEFT_RIGHT_AXIS = 0`); peak VRAM measured on the Rangpur A100.
+- **Next experiment (by 19 Oct check-off):** a 2D baseline smoke test (a few real training steps on HipMRI slices,
+  which needs the loss and `train.py`).
 - **Fallback:** if the Improved U-Net does not fit memory or cannot reach Dice 0.7, fall back to a plain 3D
   U-Net (Normal difficulty, capped at 15/20) with patch training. It still answers the dilemma against the 2D baseline.
