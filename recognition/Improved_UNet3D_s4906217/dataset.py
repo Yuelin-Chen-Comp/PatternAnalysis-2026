@@ -6,6 +6,7 @@ Each step is its own small function so it can be tested alone:
     split_patients   assign whole patients to train / val / test (stored as JSON)
     load_volume      read the NIfTI files, normalise the MR, validate the labels, cache
     sample_patch     cut a training patch, oversampling the rare organs
+    sample_slice     the same for one axial slice (the 2D baseline)
     augment          flip / intensity changes on a patch
     *Dataset         thin torch wrappers around the functions above
 
@@ -399,6 +400,23 @@ def sample_patch(volume: Volume, patch_size: Sequence[int], rng: np.random.Gener
     return volume.image[box].astype(np.float32), np.array(volume.label[box])
 
 
+def sample_slice(volume: Volume, rng: np.random.Generator, p_foreground: float = 0.5,
+                 fg_classes: Sequence[int] = FG_CLASSES) -> Tuple[np.ndarray, np.ndarray]:
+    """Cut one axial slice (the last axis) for the 2D baseline: image float32, label uint8, (X, Y).
+
+    The prostate shows in only about 26 of the 128 slices, so uniform slices would contain it
+    one time in five. With probability p_foreground the slice is the one through a random voxel
+    of a randomly chosen rare class (the same rule as sample_patch); otherwise it is uniform.
+    """
+    z = int(rng.integers(volume.image.shape[2]))
+    if rng.random() < p_foreground:
+        available = [c for c in fg_classes if len(volume.fg_coords.get(c, ())) > 0]
+        if available:
+            coords = volume.fg_coords[available[int(rng.integers(len(available)))]]
+            z = int(coords[int(rng.integers(len(coords)))][2])
+    return volume.image[:, :, z].astype(np.float32), np.array(volume.label[:, :, z])
+
+
 def augment(image: np.ndarray, label: np.ndarray, rng: np.random.Generator,
             flip_axis: Optional[int] = None, p_flip: float = 0.5,
             p_intensity: float = 0.5, p_noise: float = 0.2) -> Tuple[np.ndarray, np.ndarray]:
@@ -425,22 +443,20 @@ def augment(image: np.ndarray, label: np.ndarray, rng: np.random.Generator,
 # Stage 2: torch Datasets (thin wrappers)
 # ---------------------------------------------------------------------------
 
-class HipMRIPatchDataset(Dataset):
-    """Training data: random 3D patches. One 'epoch' is `samples_per_epoch` random draws.
+class _RandomSampleDataset(Dataset):
+    """Shared logic of the two training datasets: every draw picks a volume and cuts one random
+    sample (a patch or a slice) from it. One 'epoch' is `samples_per_epoch` random draws.
 
     balance_patients: pick a patient uniformly, then one of its volumes. Otherwise a
     patient with 8 weekly scans would be drawn 8 times as often as one with a single scan,
     and the model would fit the frequently scanned patients best.
     """
 
-    def __init__(self, volumes: Sequence[Volume], patch_size: Sequence[int] = DEFAULT_PATCH,
-                 samples_per_epoch: int = 250, p_foreground: float = 0.5,
-                 fg_classes: Sequence[int] = FG_CLASSES, balance_patients: bool = True,
-                 augment_data: bool = True):
+    def __init__(self, volumes: Sequence[Volume], samples_per_epoch: int, p_foreground: float,
+                 fg_classes: Sequence[int], balance_patients: bool, augment_data: bool):
         if not volumes:
             raise ValueError("no volumes given")
         self.volumes = list(volumes)
-        self.patch_size = tuple(patch_size)
         self.samples_per_epoch = samples_per_epoch
         self.p_foreground = p_foreground
         self.fg_classes = tuple(fg_classes)
@@ -457,7 +473,7 @@ class HipMRIPatchDataset(Dataset):
 
     def _get_rng(self) -> np.random.Generator:
         # created lazily inside each DataLoader worker from that worker's torch seed, so
-        # workers draw different patches (and torch.manual_seed makes a run reproducible)
+        # workers draw different samples (and torch.manual_seed makes a run reproducible)
         if self._rng is None:
             self._rng = np.random.default_rng(torch.initial_seed() % (2 ** 32))
         return self._rng
@@ -468,19 +484,52 @@ class HipMRIPatchDataset(Dataset):
             return self.volumes[idxs[int(rng.integers(len(idxs)))]]
         return self.volumes[int(rng.integers(len(self.volumes)))]
 
+    def _sample(self, volume: Volume, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray]:
+        raise NotImplementedError
+
     def __getitem__(self, index: int):
         rng = self._get_rng()  # the index is ignored: every draw is random
-        image, label = sample_patch(self._pick_volume(rng), self.patch_size, rng,
-                                    self.p_foreground, self.fg_classes)
-        if self.augment_data:
+        image, label = self._sample(self._pick_volume(rng), rng)
+        if self.augment_data:  # the left-right axis is axis 0 for patches and for slices alike
             image, label = augment(image, label, rng, flip_axis=LEFT_RIGHT_AXIS)
         return {"image": torch.from_numpy(image).unsqueeze(0),
                 "label": torch.from_numpy(label.astype(np.int64))}
 
 
+class HipMRIPatchDataset(_RandomSampleDataset):
+    """Training data for the 3D model: random 3D patches, image (1, X, Y, Z), label (X, Y, Z)."""
+
+    def __init__(self, volumes: Sequence[Volume], patch_size: Sequence[int] = DEFAULT_PATCH,
+                 samples_per_epoch: int = 250, p_foreground: float = 0.5,
+                 fg_classes: Sequence[int] = FG_CLASSES, balance_patients: bool = True,
+                 augment_data: bool = True):
+        super().__init__(volumes, samples_per_epoch, p_foreground, fg_classes, balance_patients, augment_data)
+        self.patch_size = tuple(patch_size)
+
+    def _sample(self, volume, rng):
+        return sample_patch(volume, self.patch_size, rng, self.p_foreground, self.fg_classes)
+
+
+class HipMRISliceDataset(_RandomSampleDataset):
+    """Training data for the 2D baseline: random axial slices, image (1, X, Y), label (X, Y).
+
+    The slices come from the same training volumes, the same patients and the same oversampling
+    as the 3D patches, so the baseline and the 3D model differ only in how much context they see.
+    """
+
+    def __init__(self, volumes: Sequence[Volume], samples_per_epoch: int = 1000, p_foreground: float = 0.5,
+                 fg_classes: Sequence[int] = FG_CLASSES, balance_patients: bool = True,
+                 augment_data: bool = True):
+        super().__init__(volumes, samples_per_epoch, p_foreground, fg_classes, balance_patients, augment_data)
+
+    def _sample(self, volume, rng):
+        return sample_slice(volume, rng, self.p_foreground, self.fg_classes)
+
+
 class HipMRIVolumeDataset(Dataset):
     """Validation / test data: whole volumes, no randomness. Use batch_size=1 (the volumes
-    differ in depth: one has 144 slices) and sliding-window inference on the result."""
+    differ in depth: one has 144 slices). A whole volume fits on the GPU (about 2 GiB for the
+    3D U-Net, see the README), so it is predicted in one pass and no sliding window is needed."""
 
     def __init__(self, volumes: Sequence[Volume]):
         self.volumes = list(volumes)
@@ -497,13 +546,18 @@ class HipMRIVolumeDataset(Dataset):
 
 
 def make_datasets(root=DEFAULT_ROOT, split_file=DEFAULT_SPLIT_FILE, which: Sequence[str] = ("train", "val"),
-                  patch_size: Sequence[int] = DEFAULT_PATCH, samples_per_epoch: int = 250,
-                  cache_dir=None, max_cases_per_split: Optional[int] = None, **patch_kwargs):
+                  patch_size: Sequence[int] = DEFAULT_PATCH, samples_per_epoch: Optional[int] = None,
+                  cache_dir=None, max_cases_per_split: Optional[int] = None, dim: int = 3, **sample_kwargs):
     """Build the requested datasets from the stored patient split.
 
     `which` defaults to train and val: the test set should only be built (which=("test",))
     for the final evaluation. max_cases_per_split limits the volumes for quick smoke tests.
+    dim = 3 trains on random 3D patches (patch_size, 250 draws per epoch by default); dim = 2
+    trains on random axial slices (1000 per epoch by default; patch_size is ignored). The
+    validation and test sets are whole volumes in both cases, so both models are scored in 3D.
     """
+    if dim not in (2, 3):
+        raise ValueError(f"dim must be 2 or 3, got {dim!r}")
     cases = find_cases(root)
     split = load_or_create_split(cases, split_file)
     datasets = {}
@@ -515,8 +569,12 @@ def make_datasets(root=DEFAULT_ROOT, split_file=DEFAULT_SPLIT_FILE, which: Seque
             subset = subset[:max_cases_per_split]
         print(f"{name}: {len(subset)} volumes from {len({c.patient for c in subset})} patients")
         volumes = load_volumes(subset, cache_dir, FG_CLASSES if name == "train" else ())
-        datasets[name] = (HipMRIPatchDataset(volumes, patch_size, samples_per_epoch, **patch_kwargs)
-                          if name == "train" else HipMRIVolumeDataset(volumes))
+        if name != "train":
+            datasets[name] = HipMRIVolumeDataset(volumes)
+        elif dim == 3:
+            datasets[name] = HipMRIPatchDataset(volumes, patch_size, samples_per_epoch or 250, **sample_kwargs)
+        else:
+            datasets[name] = HipMRISliceDataset(volumes, samples_per_epoch or 1000, **sample_kwargs)
     return datasets
 
 

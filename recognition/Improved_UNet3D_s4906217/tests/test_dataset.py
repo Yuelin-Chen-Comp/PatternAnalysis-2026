@@ -16,7 +16,8 @@ import dataset  # noqa: E402
 from dataset import (BLADDER, FG_CLASSES, PROSTATE, RECTUM, Case, LeakageError, Volume,  # noqa: E402
                      assert_no_leakage, augment, cases_for, crop_slices, find_cases,
                      find_foreground, load_or_create_split, load_volume, normalise_mr,
-                     pair_key, patient_id, sample_patch, split_patients, to_label_array)
+                     pair_key, patient_id, sample_patch, sample_slice, split_patients,
+                     to_label_array)
 
 HAS_TORCH = dataset.torch is not None
 
@@ -308,6 +309,78 @@ def test_augment_changes_intensities_but_never_labels():
     assert out_image.dtype == np.float32 and out_image.shape == image.shape
     assert not np.array_equal(out_image, image)
     assert np.array_equal(out_label, label)
+
+
+# ---------------------------------------------------------------------------
+# 2D slices for the baseline, and make_datasets
+# ---------------------------------------------------------------------------
+
+def test_sample_slice_shapes_and_alignment():
+    vol = make_volume()
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        image, label = sample_slice(vol, rng, p_foreground=0.0)
+        assert image.shape == label.shape == (32, 32)
+        assert image.dtype == np.float32 and label.dtype == np.uint8
+        # image and label come from the same axial slice of the volume
+        z = [k for k in range(vol.image.shape[2]) if np.array_equal(vol.label[:, :, k], label)
+             and np.array_equal(vol.image[:, :, k].astype(np.float32), image)]
+        assert z, "the image slice and the label slice must be the same slice z"
+
+
+def test_sample_slice_oversamples_slices_with_the_rare_organ():
+    vol = make_volume()   # the prostate sits in 3 of the 16 slices
+    rng = np.random.default_rng(1)
+
+    def hit_rate(p):
+        hits = sum(bool((sample_slice(vol, rng, p, fg_classes=(PROSTATE,))[1] == PROSTATE).any())
+                   for _ in range(300))
+        return hits / 300
+
+    assert hit_rate(1.0) == 1.0, "with p_foreground=1 every slice must contain the prostate"
+    assert hit_rate(0.0) < 0.4, "uniform slices should rarely show a 3-slice organ (3/16 expected)"
+
+
+def test_slice_dataset_items():
+    need_torch()
+    ds = dataset.HipMRISliceDataset([make_volume()], samples_per_epoch=7)
+    assert len(ds) == 7
+    item = ds[0]
+    assert tuple(item["image"].shape) == (1, 32, 32) and tuple(item["label"].shape) == (32, 32)
+    assert "float32" in str(item["image"].dtype) and "int64" in str(item["label"].dtype)
+
+
+def make_fake_study(root: Path, cache: Path, n_patients=8, weeks=2):
+    """A tiny stand-in for the study: empty .nii.gz files plus a ready-made preprocessed cache, so
+    make_datasets runs end to end without nibabel and without any real data."""
+    volumes = [(f"B{i:03d}", w) for i in range(n_patients) for w in range(weeks)]
+    make_dataset(root, volumes)
+    for case in find_cases(root):
+        vol = make_volume(case.name, case.patient, seed=sum(map(ord, case.name)))
+        path = dataset._cache_path(case, cache)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(path, image=vol.image, label=vol.label, spacing=np.asarray(vol.spacing, dtype=np.float32))
+
+
+def test_make_datasets_builds_a_leak_free_2d_and_3d_pipeline():
+    need_torch()
+    with tempfile.TemporaryDirectory() as tmp:
+        root, cache, split_file = Path(tmp) / "study", Path(tmp) / "cache", Path(tmp) / "split.json"
+        make_fake_study(root, cache)
+        for dim, train_cls in ((2, dataset.HipMRISliceDataset), (3, dataset.HipMRIPatchDataset)):
+            ds = dataset.make_datasets(root, split_file, which=("train", "val", "test"), cache_dir=cache,
+                                       patch_size=(16, 16, 8), samples_per_epoch=3, dim=dim)
+            assert type(ds["train"]) is train_cls and len(ds["train"]) == 3
+            assert type(ds["val"]) is dataset.HipMRIVolumeDataset and type(ds["test"]) is dataset.HipMRIVolumeDataset
+            patients = {n: {v.patient for v in ds[n].volumes} for n in ("train", "val", "test")}
+            assert not (patients["train"] & patients["val"] or patients["train"] & patients["test"]
+                        or patients["val"] & patients["test"]), "a patient appears in two splits"
+            assert sum(len(p) for p in patients.values()) == 8
+            item = ds["train"][0]
+            assert tuple(item["image"].shape) == ((1, 16, 16, 8) if dim == 3 else (1, 32, 32))
+            assert tuple(ds["val"][0]["image"].shape) == (1, 32, 32, 16)
+        assert raises(ValueError, dataset.make_datasets, root, split_file, dim=4)
+        assert raises(ValueError, dataset.make_datasets, root, split_file, which=("holdout",), cache_dir=cache)
 
 
 # ---------------------------------------------------------------------------
