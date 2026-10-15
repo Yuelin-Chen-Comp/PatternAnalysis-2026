@@ -19,6 +19,9 @@ Conventions
 * Volumes keep the file axis order (X, Y, Z) = (256, 256, 128). Z (1.56 mm, constant)
   is the slice axis. Image tensors are (C, X, Y, Z), label tensors (X, Y, Z). Image and
   label go through the same loader and the same crop / flip code, so they cannot drift.
+* Axes (confirmed by scripts/check_orientation.py on 40 volumes): X is left-right, Y is
+  anterior-posterior (higher index = posterior), Z is superior-inferior (higher index =
+  superior, towards the bladder).
 * Labels 0-5: background, body, bone, bladder, rectum, prostate. The order of 1-5 is
   inferred from voxel fractions and slice extents (confirm with an overlay plot).
 * File names (confirmed by the data audit):
@@ -65,8 +68,9 @@ FG_CLASSES = (BLADDER, RECTUM, PROSTATE)  # the rare organs that patch sampling 
 DEFAULT_PATCH = (128, 128, 64)
 PREPROC_VERSION = 1      # bump when normalise_mr / label handling changes: it invalidates the cache
 CLIP_PERCENTILE = 99.5   # MR intensities above this (computed on non-zero voxels) are clipped
-LEFT_RIGHT_AXIS = None   # array axis that is left-right; set it after scripts/check_orientation.py,
-                         # None means "never flip" (a flip along the wrong axis is anatomically wrong)
+LEFT_RIGHT_AXIS = 0      # array axis that is left-right, confirmed by scripts/check_orientation.py (affine
+                         # codes L, P, S and organ centroid offsets); None would mean "never flip", and a
+                         # flip along any other axis is anatomically wrong
 
 _PATIENT_RE = re.compile(r"^([A-Za-z]\d+)_")
 _MODALITY_RE = re.compile(r"[_-]?(lfov|semantic)$", re.IGNORECASE)
