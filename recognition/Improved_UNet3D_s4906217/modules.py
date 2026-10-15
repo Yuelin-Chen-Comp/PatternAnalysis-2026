@@ -1,0 +1,223 @@
+"""Model components for HipMRI prostate segmentation (PyTorch only, no NumPy).
+
+This file holds the two models the study compares:
+
+    UNet2D   the baseline: a 2D U-Net (Ronneberger et al., 2015) run on axial slices
+    UNet3D   a plain 3D U-Net (Cicek et al., 2016) run on 3D patches
+
+The 3D Improved U-Net (Isensee et al., 2018) will be built from the same blocks.
+
+Both models are the same class, UNet, with dim = 2 or 3. They share ConvBlock, Down and Up,
+so the only thing that differs between the baseline and the 3D model is the dimensionality:
+a difference in Dice or memory cannot come from different normalisation or activations.
+
+Tensor layout (matches dataset.py):
+    3D model  input (B, 1, X, Y, Z)   output logits (B, num_classes, X, Y, Z)
+    2D model  input (B, 1, X, Y)      output logits (B, num_classes, X, Y)
+A volume is (X, Y, Z) = (256, 256, 128) and Z is the slice axis, so the 2D baseline sees
+256 x 256 axial slices. The models return raw logits; softmax lives in the loss.
+
+Differences from the original papers, chosen on purpose:
+* 'same' padding (padding=1) instead of 'valid', so the output has the input's size and the
+  Dice is computed on every voxel.
+* Instance normalisation by default instead of batch normalisation. A 3D patch is large, so
+  only a batch of 1-2 fits in memory, and batch statistics from one or two patches are noisy.
+  Instance norm does not depend on the batch, so the 2D baseline (batch of many slices) and
+  the 3D model (batch of 1-2 patches) are normalised the same way.
+* The channel count doubles at every level starting from base_channels, which is smaller
+  than the originals so a 128 x 128 x 64 patch trains on one GPU.
+"""
+from typing import Optional
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+_CONV = {2: nn.Conv2d, 3: nn.Conv3d}
+_CONV_TRANSPOSE = {2: nn.ConvTranspose2d, 3: nn.ConvTranspose3d}
+_MAX_POOL = {2: nn.MaxPool2d, 3: nn.MaxPool3d}
+_INSTANCE_NORM = {2: nn.InstanceNorm2d, 3: nn.InstanceNorm3d}
+_BATCH_NORM = {2: nn.BatchNorm2d, 3: nn.BatchNorm3d}
+
+
+def _check_dim(dim: int) -> None:
+    if dim not in (2, 3):
+        raise ValueError(f"dim must be 2 or 3, got {dim!r}")
+
+
+def init_weights(module: nn.Module) -> None:
+    """Kaiming-normal initialisation for every convolution (use with model.apply).
+
+    The gain matches the LeakyReLU(0.01) that follows each convolution, which keeps the size
+    of the activations roughly constant from the first level to the deepest one.
+    """
+    if isinstance(module, (nn.Conv2d, nn.Conv3d, nn.ConvTranspose2d, nn.ConvTranspose3d)):
+        nn.init.kaiming_normal_(module.weight, a=0.01, nonlinearity="leaky_relu")
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+
+def count_parameters(model: nn.Module, trainable_only: bool = True) -> int:
+    """Number of parameters, for the resource table in the README."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad or not trainable_only)
+
+
+class ConvBlock(nn.Module):
+    """Two times (3x3(x3) convolution -> normalisation -> LeakyReLU): the unit of one U-Net level.
+
+    The convolutions have no bias because the normalisation that follows would cancel it
+    (instance norm brings its own learnable shift).
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, dim: int = 3, norm: str = "instance"):
+        super().__init__()
+        _check_dim(dim)
+        if norm == "instance":
+            make_norm = lambda channels: _INSTANCE_NORM[dim](channels, affine=True)  # noqa: E731
+        elif norm == "batch":
+            make_norm = _BATCH_NORM[dim]
+        else:
+            raise ValueError(f"norm must be 'instance' or 'batch', got {norm!r}")
+        layers = []
+        for cin in (in_channels, out_channels):
+            layers += [_CONV[dim](cin, out_channels, kernel_size=3, padding=1, bias=False),
+                       make_norm(out_channels),
+                       nn.LeakyReLU(0.01, inplace=True)]
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class Down(nn.Module):
+    """Encoder step: halve every spatial size with a max-pool, then a ConvBlock."""
+
+    def __init__(self, in_channels: int, out_channels: int, dim: int = 3, norm: str = "instance"):
+        super().__init__()
+        _check_dim(dim)
+        self.pool = _MAX_POOL[dim](kernel_size=2)
+        self.conv = ConvBlock(in_channels, out_channels, dim, norm)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(self.pool(x))
+
+
+class Up(nn.Module):
+    """Decoder step: double the spatial sizes, concatenate the encoder skip, then a ConvBlock.
+
+    The upsampling is a learned 2x2(x2) transposed convolution with stride 2. Max-pooling
+    rounds odd sizes down (15 -> 7), so the upsampled map (14) can be smaller than the skip
+    (15); it is zero-padded at the end to match, which makes any input size work.
+    """
+
+    def __init__(self, in_channels: int, skip_channels: int, out_channels: int,
+                 dim: int = 3, norm: str = "instance"):
+        super().__init__()
+        _check_dim(dim)
+        self.up = _CONV_TRANSPOSE[dim](in_channels, out_channels, kernel_size=2, stride=2)
+        self.conv = ConvBlock(out_channels + skip_channels, out_channels, dim, norm)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.up(x)
+        missing = [s - u for s, u in zip(skip.shape[2:], x.shape[2:])]
+        if any(missing):
+            pad = []
+            for m in reversed(missing):  # F.pad lists the last axis first
+                pad += [0, m]
+            x = F.pad(x, pad)
+        return self.conv(torch.cat([skip, x], dim=1))
+
+
+class UNet(nn.Module):
+    """U-Net with `depth` down-steps; dim = 2 gives the 2D model, dim = 3 the 3D model.
+
+    Level i has base_channels * 2**i channels, so the default (base 16, depth 4) goes
+    16, 32, 64, 128, 256 from the first level to the bottleneck. Every spatial size of the
+    input should be at least 2**depth, and the bottleneck must hold more than one voxel
+    (instance norm cannot normalise a single value).
+    """
+
+    def __init__(self, dim: int = 3, in_channels: int = 1, num_classes: int = 6,
+                 base_channels: int = 16, depth: int = 4, norm: str = "instance"):
+        super().__init__()
+        _check_dim(dim)
+        if depth < 1:
+            raise ValueError(f"depth must be at least 1, got {depth}")
+        self.dim = dim
+        channels = [base_channels * 2 ** level for level in range(depth + 1)]
+        self.first = ConvBlock(in_channels, channels[0], dim, norm)
+        self.downs = nn.ModuleList(Down(channels[i], channels[i + 1], dim, norm) for i in range(depth))
+        self.ups = nn.ModuleList(Up(channels[i + 1], channels[i], channels[i], dim, norm)
+                                 for i in reversed(range(depth)))
+        self.head = _CONV[dim](channels[0], num_classes, kernel_size=1)
+        self.apply(init_weights)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != self.dim + 2:
+            raise ValueError(f"a {self.dim}D UNet expects (B, C{', X, Y, Z' if self.dim == 3 else ', X, Y'}) "
+                             f"input, got shape {tuple(x.shape)}")
+        skips = [self.first(x)]
+        for down in self.downs:
+            skips.append(down(skips[-1]))
+        x = skips.pop()  # the bottleneck
+        for up in self.ups:
+            x = up(x, skips.pop())
+        return self.head(x)
+
+
+class UNet2D(UNet):
+    """The baseline: a 2D U-Net. Base 32 channels, since a 256 x 256 slice is cheap."""
+
+    def __init__(self, in_channels: int = 1, num_classes: int = 6, base_channels: int = 32,
+                 depth: int = 4, norm: str = "instance"):
+        super().__init__(2, in_channels, num_classes, base_channels, depth, norm)
+
+
+class UNet3D(UNet):
+    """A plain 3D U-Net. Base 16 channels, so a 128 x 128 x 64 patch fits on one GPU."""
+
+    def __init__(self, in_channels: int = 1, num_classes: int = 6, base_channels: int = 16,
+                 depth: int = 4, norm: str = "instance"):
+        super().__init__(3, in_channels, num_classes, base_channels, depth, norm)
+
+
+# ---------------------------------------------------------------------------
+# Running the 2D baseline on a 3D volume
+# ---------------------------------------------------------------------------
+# The baseline is trained on single slices but evaluated on the same test volumes as the 3D
+# model: every axial slice goes through the 2D network and the logits are stacked back into
+# a volume, so Dice is computed in 3D, voxel for voxel, on an identical split. Stacking
+# independent slices is also what makes the baseline's boundaries jagged between slices.
+
+def volume_to_slices(volume: torch.Tensor) -> torch.Tensor:
+    """(B, C, X, Y, Z) -> (B*Z, C, X, Y): every axial slice becomes one 2D sample."""
+    b, c, x, y, z = volume.shape
+    return volume.permute(0, 4, 1, 2, 3).reshape(b * z, c, x, y)
+
+
+def slices_to_volume(slices: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """(B*Z, K, X, Y) -> (B, K, X, Y, Z): the inverse of volume_to_slices."""
+    n, k, x, y = slices.shape
+    if n % batch_size:
+        raise ValueError(f"{n} slices cannot be split into {batch_size} volumes")
+    z = n // batch_size
+    return slices.reshape(batch_size, z, k, x, y).permute(0, 2, 3, 4, 1).contiguous()
+
+
+class SliceWise(nn.Module):
+    """Apply a 2D model to every axial slice of a volume and stack the logits into a volume.
+
+    For evaluation, not for training: the slices are run in chunks of `chunk_size` to bound
+    the memory (a whole volume is 128 slices). With instance norm a chunk gives exactly the
+    same result as one big batch; with batch norm only in eval mode.
+    """
+
+    def __init__(self, model2d: nn.Module, chunk_size: Optional[int] = 32):
+        super().__init__()
+        self.model2d = model2d
+        self.chunk_size = chunk_size
+
+    def forward(self, volume: torch.Tensor) -> torch.Tensor:
+        slices = volume_to_slices(volume)
+        chunks = slices.split(self.chunk_size) if self.chunk_size else (slices,)
+        return slices_to_volume(torch.cat([self.model2d(c) for c in chunks], dim=0), volume.shape[0])
