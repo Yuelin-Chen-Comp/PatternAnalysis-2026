@@ -24,8 +24,9 @@ shift 2
 echo "Job $SLURM_JOB_ID on $(hostname), started $(date)"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
-source $HOME/miniconda3/bin/activate
-conda activate torch
+# The environment is named explicitly: a bare 'source .../activate' would hand train.py's arguments
+# (--epochs ...) on to conda, which rejects them ("activate does not accept more than one argument").
+source $HOME/miniconda3/bin/activate torch
 
 python -c "import nibabel" 2>/dev/null || pip install --no-cache-dir nibabel
 python -c "import matplotlib" 2>/dev/null || pip install --no-cache-dir matplotlib
