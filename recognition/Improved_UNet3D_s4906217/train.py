@@ -291,10 +291,13 @@ def main(argv=None) -> Dict:
     for epoch in range(1, args.epochs + 1):
         t0 = time.perf_counter()
         train_loss = train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, amp_dtype, args.grad_clip)
-        entry = {"epoch": epoch, "train_loss": train_loss, "lr": optimizer.param_groups[0]["lr"]}
+        entry = {"epoch": epoch, "train_loss": train_loss, "lr": optimizer.param_groups[0]["lr"],
+                 "train_seconds": time.perf_counter() - t0}
         scheduler.step()
         if epoch % args.val_every == 0 or epoch == args.epochs:
+            t_val = time.perf_counter()
             val = summarise(evaluate(model, val_loader, dim, device, amp_dtype))
+            entry["val_seconds"] = time.perf_counter() - t_val
             entry["val_dice"] = val["dice_mean"]
             entry["val_prostate_dice"] = val["dice_mean"][PROSTATE]
             entry["val_mean_dice"] = float(np.nanmean(val["dice_mean"][1:]))
@@ -308,7 +311,8 @@ def main(argv=None) -> Dict:
         write_json(run_dir / "history.json", history)
         val_text = f"val prostate Dice {entry['val_prostate_dice']:.4f}, mean {entry['val_mean_dice']:.4f}  " \
             if "val_dice" in entry else ""
-        print(f"epoch {epoch:3d}/{args.epochs}  loss {train_loss:.4f}  {val_text}({entry['seconds']:.1f}s)", flush=True)
+        split_text = f"train {entry['train_seconds']:.1f}s" + (f", val {entry['val_seconds']:.1f}s" if "val_dice" in entry else "")
+        print(f"epoch {epoch:3d}/{args.epochs}  loss {train_loss:.4f}  {val_text}({entry['seconds']:.1f}s: {split_text})", flush=True)
     torch.save({"model": model.state_dict(), "epoch": args.epochs, "args": json_safe(vars(args))}, run_dir / "last.pt")
 
     summary = {"best_val_prostate_dice": best, "best_epoch": best_epoch,

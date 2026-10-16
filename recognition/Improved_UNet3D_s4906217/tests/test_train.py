@@ -63,6 +63,7 @@ def test_pipeline_runs_end_to_end_for_both_models_and_writes_its_outputs():
             assert [h["epoch"] for h in history] == [1, 2]
             assert all(h["train_loss"] == h["train_loss"] and h["train_loss"] > 0 for h in history)
             assert len(history[-1]["val_dice"]) == 6
+            assert all(h["train_seconds"] > 0 and h["val_seconds"] > 0 for h in history), "per-phase timings are logged"
             config = json.loads((run / "config.json").read_text())
             assert (config["train_patients"], config["train_volumes"], config["val_volumes"]) == (6, 12, 2)
             assert summary["best_epoch"] in (1, 2)
