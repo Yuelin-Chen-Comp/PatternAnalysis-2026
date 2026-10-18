@@ -172,6 +172,59 @@ def test_select_cases_picks_the_worst_and_a_typical_one():
     assert all(r["name"] != "v4" for _, r in chosen), "a volume without a defined Dice is never chosen"
 
 
+def test_missed_prostate_is_attributed_to_the_class_that_took_it():
+    need(torch is not None)
+    gt = block()                                                       # prostate on z 10..21: apex 10-13, mid 14-17, base 18-21
+    label = labels_from(prostate=gt)
+    pred = labels_from(prostate=gt)
+    pred[gt & (np.arange(30)[None, None, :] >= 18)] = BLADDER           # the whole base third is called bladder
+    mid = gt & (np.arange(30)[None, None, :] >= 14) & (np.arange(30)[None, None, :] < 18)
+    half = mid & (np.arange(20)[None, :, None] < 10)                    # y 6..9: 4 of the 8 columns of the block
+    pred[half] = RECTUM                                                 # half of the middle third is called rectum
+    r = predict.analyse_volume(pred, label, (1, 1, 1))
+    assert (r["recall_apex"], r["recall_mid"], r["recall_base"]) == (1.0, 0.5, 0.0)
+    assert r["miss_to_bladder_base"] == 1.0 and r["miss_to_rectum_base"] == 0.0
+    assert r["miss_to_rectum_mid"] == 0.5 and r["miss_to_bladder_mid"] == 0.0
+    assert r["miss_to_bladder_apex"] == 0.0 and r["miss_to_other_apex"] == 0.0
+    assert abs(r["recall"] - 0.5) < 1e-9 and abs(r["miss_to_bladder"] - 1 / 3) < 1e-9
+    assert abs(r["miss_to_rectum"] - 1 / 6) < 1e-9 and abs(r["miss_to_other"]) < 1e-9
+    # the old leakage number does not see this error at all: no PREDICTED prostate lies in the bladder or rectum
+    assert r["leak_bladder"] == 0.0 and r["leak_rectum"] == 0.0
+
+
+def test_where_the_prostate_goes_always_adds_up_to_one():
+    need(torch is not None)
+    rng = np.random.default_rng(0)
+    label = labels_from(prostate=block())
+    pred = rng.integers(0, 6, size=label.shape).astype(np.uint8)
+    r = predict.analyse_volume(pred, label, (1, 1, 1))
+    for suffix in ("", "_apex", "_mid", "_base"):
+        total = sum(r[k + suffix] for k in ("recall", "miss_to_bladder", "miss_to_rectum", "miss_to_other"))
+        assert abs(total - 1.0) < 1e-9, (suffix, total)
+    assert predict.miss_fractions(pred, labels_from())["recall"] != predict.miss_fractions(pred, labels_from())["recall"]  # NaN
+
+
+def test_a_stray_fragment_does_not_count_as_reach_beyond_the_base():
+    need(torch is not None and predict.ndimage is not None, "scipy not installed")
+    gt = block(z=(10, 22))
+    pred = gt.copy()
+    pred[1:3, 1:3, 27:29] = True                                       # a small fragment 6 slices above the prostate
+    r = predict.analyse_volume(labels_from(prostate=pred), labels_from(prostate=gt), (1, 1, 1.5))
+    assert r["base_error_slices"] == 0 and r["base_error_mm"] == 0.0, "the reach is that of the main blob"
+    assert r["n_components"] == 2 and r["outside_extent_fraction"] > 0, "but the fragment is still counted elsewhere"
+
+
+def test_patient_level_averages_over_patients_not_volumes():
+    need(torch is not None)
+    rows = [{"patient": "A", "x": 1.0}, {"patient": "A", "x": 1.0}, {"patient": "A", "x": 1.0}, {"patient": "B", "x": 0.0}]
+    per_patient, over = predict.patient_level(rows, ["x"])
+    assert per_patient == {"A": {"x": 1.0}, "B": {"x": 0.0}}
+    assert over["x"] == (0.5, 0.5), "volume mean would be 0.75; patient-level mean is 0.5"
+    nan = float("nan")
+    _, over_nan = predict.patient_level([{"patient": "A", "x": nan}, {"patient": "B", "x": 0.2}], ["x"])
+    assert abs(over_nan["x"][0] - 0.2) < 1e-9, "a patient without a defined value is skipped"
+
+
 # ---------------------------------------------------------------------------
 # the whole pipeline on a fake study
 # ---------------------------------------------------------------------------
@@ -196,6 +249,8 @@ def test_predict_runs_end_to_end_for_both_models():
             split = json.loads((tmp / "split.json").read_text())
             assert {v["patient"] for v in saved["volumes"]} == set(split["val"])
             assert len(saved["volumes"][0]["dice"]) == 6
+            assert set(saved["summary"]["per_patient"]) == set(split["val"])
+            assert "prostate_dice" in saved["summary"]["patient_level"] and "miss_to_bladder_base_mean" in saved["summary"]
             for key in ("dice_apex", "leak_rectum", "continuity_pred"):
                 assert key in saved["volumes"][0]
             try:

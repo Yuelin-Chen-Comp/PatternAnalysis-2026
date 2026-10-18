@@ -5,13 +5,17 @@ IoU, the prostate is examined where a good global Dice can hide a failure:
 
 * Dice of the apex, middle and base third of the prostate (thirds of the ground-truth extent along the slice axis);
 * how far the predicted prostate reaches beyond the true base and apex, in slices and mm;
-* the share of the predicted prostate lying inside the ground-truth rectum or bladder (boundary leakage);
-* the number of connected components of the predicted prostate (small disconnected artifacts);
+* the share of the predicted prostate lying inside the ground-truth rectum or bladder (boundary leakage), and the
+  opposite error, where the true prostate goes when it is missed: called bladder, rectum or something else
+  (a prostate base that is read as bladder is under-contouring, which this leakage number cannot see);
+* the number of connected components of the predicted prostate (small disconnected artifacts); the reach beyond the
+  base and apex is measured on the largest component, so that a stray fragment does not count as the prostate;
 * the Dice between neighbouring slices, for prediction and ground truth (the slice-to-slice continuity that a
   2D model does not enforce).
 
-It prints the results, writes results.json, a summary figure, and multi-panel figures (input, ground truth,
-prediction, difference) of the worst cases, which are the failure cases to inspect.
+It prints the results per volume and per patient (the weekly scans of one patient are not independent, so the
+patients are the real sample size), writes results.json, a summary figure, and multi-panel figures (input, ground
+truth, prediction, difference) of the worst cases, which are the failure cases to inspect.
 
     python predict.py --name baseline2d                          # validation split, development
     python predict.py --name unet3d --split test                 # the final analysis on the held-out test patients
@@ -86,20 +90,51 @@ def adjacent_slice_dice(mask: np.ndarray) -> float:
     return float(np.mean(2 * inter[keep] / denom[keep])) if keep.any() else NAN
 
 
+def main_blob(mask: np.ndarray) -> Tuple[np.ndarray, float, float]:
+    """The largest 26-connected component of a mask, how many components there are, and the share of the mask
+    outside the largest one. Without scipy the mask itself is returned and the two numbers are NaN."""
+    if ndimage is None or not mask.any():
+        return mask, NAN, NAN
+    components, n = ndimage.label(mask, structure=np.ones((3, 3, 3)))
+    sizes = np.bincount(components.ravel())[1:]
+    largest = int(np.argmax(sizes)) + 1
+    return components == largest, int(n), 1.0 - float(sizes.max()) / int(mask.sum())
+
+
+def miss_fractions(pred_slab: np.ndarray, label_slab: np.ndarray) -> Dict[str, float]:
+    """Where the true prostate voxels of a slab go in the prediction, as shares of those voxels:
+    kept as prostate (recall), called bladder, called rectum, or called something else (background, body, bone).
+    All NaN when the slab holds no true prostate."""
+    called = pred_slab[label_slab == PROSTATE]
+    if called.size == 0:
+        return {"recall": NAN, "miss_to_bladder": NAN, "miss_to_rectum": NAN, "miss_to_other": NAN}
+    share = np.bincount(called.astype(np.int64), minlength=dataset.NUM_CLASSES) / called.size
+    return {"recall": float(share[PROSTATE]), "miss_to_bladder": float(share[BLADDER]),
+            "miss_to_rectum": float(share[RECTUM]),
+            "miss_to_other": float(1.0 - share[PROSTATE] - share[BLADDER] - share[RECTUM])}
+
+
 def analyse_volume(pred: np.ndarray, label: np.ndarray, spacing: Tuple[float, float, float]) -> Dict[str, float]:
     """The boundary-focused measurements of one volume (flat dict of numbers; NaN where undefined)."""
     gt, pr = label == PROSTATE, pred == PROSTATE
     n_pred = int(pr.sum())
     out = {"gt_prostate_voxels": int(gt.sum()), "pred_prostate_voxels": n_pred}
 
-    extent, pred_extent = prostate_extent(gt), prostate_extent(pr)
+    blob, n_components, outside_largest = main_blob(pr)
+    extent, pred_extent = prostate_extent(gt), prostate_extent(blob)   # the reach is that of the main blob
     out.update(gt_z_lo=extent[0] if extent else NAN, gt_z_hi=extent[1] if extent else NAN,
                gt_slices=(extent[1] - extent[0] + 1) if extent else NAN)
+    out["volume_ratio"] = n_pred / out["gt_prostate_voxels"] if out["gt_prostate_voxels"] else NAN
     out.update(dice_apex=NAN, dice_mid=NAN, dice_base=NAN, outside_extent_fraction=NAN,
                base_error_slices=NAN, apex_error_slices=NAN, base_error_mm=NAN, apex_error_mm=NAN)
+    out.update(miss_fractions(pred, label))
+    for name in THIRDS:
+        out.update({f"{key}_{name}": NAN for key in ("recall", "miss_to_bladder", "miss_to_rectum", "miss_to_other")})
     if extent:
         for name, (a, b) in thirds(*extent).items():
             out[f"dice_{name}"] = dice_binary(pr[:, :, a:b], gt[:, :, a:b])
+            out.update({f"{key}_{name}": value
+                        for key, value in miss_fractions(pred[:, :, a:b], label[:, :, a:b]).items()})
         if n_pred:
             outside = n_pred - int(pr[:, :, extent[0]:extent[1] + 1].sum())
             out["outside_extent_fraction"] = outside / n_pred
@@ -112,12 +147,7 @@ def analyse_volume(pred: np.ndarray, label: np.ndarray, spacing: Tuple[float, fl
     out["leak_rectum"] = int((pr & (label == RECTUM)).sum()) / n_pred if n_pred else NAN
     out["leak_bladder"] = int((pr & (label == BLADDER)).sum()) / n_pred if n_pred else NAN
 
-    out["n_components"], out["outside_largest_fraction"] = NAN, NAN
-    if ndimage is not None and n_pred:
-        components, n = ndimage.label(pr, structure=np.ones((3, 3, 3)))
-        sizes = np.bincount(components.ravel())[1:]
-        out["n_components"] = int(n)
-        out["outside_largest_fraction"] = 1.0 - float(sizes.max()) / n_pred   # share not in the main blob
+    out["n_components"], out["outside_largest_fraction"] = n_components, outside_largest
 
     out["continuity_pred"], out["continuity_gt"] = adjacent_slice_dice(pr), adjacent_slice_dice(gt)
     return out
@@ -128,6 +158,17 @@ def nan_stats(values: List[float]) -> Tuple[float, float]:
     v = np.array(values, dtype=float)
     v = v[~np.isnan(v)]
     return (float(v.mean()), float(v.std())) if len(v) else (NAN, NAN)
+
+
+def patient_level(rows: List[Dict], keys: List[str]) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Tuple[float, float]]]:
+    """Average each measure over the volumes of one patient, then over the patients.
+
+    The weekly volumes of a patient are near-copies of each other, so 48 volumes from 6 patients are 6 independent
+    samples. Returns the per-patient means and, for each key, the mean and std over patients.
+    """
+    patients = sorted({r["patient"] for r in rows})
+    per_patient = {p: {k: nan_stats([r[k] for r in rows if r["patient"] == p])[0] for k in keys} for p in patients}
+    return per_patient, {k: nan_stats([per_patient[p][k] for p in patients]) for k in keys}
 
 
 # ---------------------------------------------------------------------------
@@ -245,8 +286,17 @@ def plot_case(path: Path, volume: dataset.Volume, pred: np.ndarray, title: str) 
                 ax.set_title(("input", "ground truth", "prediction", "difference")[c], fontsize=10)
             if c == 0:
                 ax.set_ylabel(name, fontsize=8)
-    fig.suptitle(title, fontsize=10)
-    fig.tight_layout()
+    from matplotlib.patches import Patch   # the colours mean different things in the columns, so say so
+    swatch = lambda name: Patch(facecolor=COLOURS[name], alpha=0.85)  # noqa: E731
+    fig.legend([swatch("bladder"), swatch("rectum"), swatch("prostate")], ["bladder", "rectum", "prostate"],
+               loc="lower center", bbox_to_anchor=(0.40, 0.0), ncol=3, fontsize=8, title_fontsize=8,
+               title="ground truth and prediction", frameon=False)
+    fig.legend([swatch("tp"), swatch("fn"), swatch("fp"), swatch("leak")],
+               ["correct prostate", "missed prostate (FN)", "false prostate (FP)", "FP inside true rectum/bladder"],
+               loc="lower center", bbox_to_anchor=(0.80, 0.0), ncol=2, fontsize=8, title_fontsize=8,
+               title="difference", frameon=False)
+    fig.suptitle(title, fontsize=9)
+    fig.tight_layout(rect=(0, 0.07, 1, 0.97))
     fig.savefig(path, dpi=120)
     plt.close(fig)
     return True
@@ -334,17 +384,23 @@ def main(argv=None) -> Dict:
         dice, iou = utils.per_class_scores(torch.from_numpy(pred).long(), torch.from_numpy(vol.label).long(),
                                            dataset.NUM_CLASSES)
         row = {"name": vol.name, "patient": vol.patient, "seconds": seconds,
-               "dice": dice.tolist(), "iou": iou.tolist(), **analyse_volume(pred, vol.label, vol.spacing)}
+               "dice": dice.tolist(), "iou": iou.tolist(), "prostate_dice": float(dice[PROSTATE]),
+               "prostate_iou": float(iou[PROSTATE]), **analyse_volume(pred, vol.label, vol.spacing)}
         rows.append(row)
         by_name[vol.name] = (vol, pred)
         print(f"  {i:3d}/{len(volumes)}  {vol.name:16s} prostate Dice {row['dice'][PROSTATE]:.3f}  "
               f"(apex {row['dice_apex']:.3f}, mid {row['dice_mid']:.3f}, base {row['dice_base']:.3f})", flush=True)
 
     summary = train.summarise(rows)
-    for key in ("dice_apex", "dice_mid", "dice_base", "leak_rectum", "leak_bladder", "outside_extent_fraction",
-                "base_error_mm", "apex_error_mm", "n_components", "outside_largest_fraction",
-                "continuity_pred", "continuity_gt"):
+    keys = (["prostate_dice", "dice_apex", "dice_mid", "dice_base", "volume_ratio", "leak_rectum", "leak_bladder",
+             "outside_extent_fraction", "base_error_mm", "apex_error_mm", "n_components", "outside_largest_fraction",
+             "continuity_pred", "continuity_gt", "recall", "miss_to_bladder", "miss_to_rectum", "miss_to_other"]
+            + [f"{k}_{t}" for t in THIRDS for k in ("recall", "miss_to_bladder", "miss_to_rectum", "miss_to_other")])
+    for key in keys:
         summary[key + "_mean"], summary[key + "_std"] = nan_stats([r[key] for r in rows])
+    per_patient, over_patients = patient_level(rows, keys)
+    summary["per_patient"] = per_patient
+    summary["patient_level"] = {k: {"mean": m, "std": sd} for k, (m, sd) in over_patients.items()}
     if device.type == "cuda":
         summary["peak_inference_gib"] = torch.cuda.max_memory_allocated() / 2 ** 30
 
@@ -365,6 +421,24 @@ def main(argv=None) -> Dict:
                        ("neighbouring-slice Dice, prediction", "continuity_pred"),
                        ("neighbouring-slice Dice, ground truth", "continuity_gt")):
         print(f"  {label:52s}{summary[key + '_mean']:9.3f} +- {summary[key + '_std']:.3f}")
+    print("\nWhere the true prostate goes: share of its voxels kept as prostate, or called bladder, rectum, other; "
+          "mean over volumes")
+    print(f"  {'':14s}{'kept (recall)':>15s}{'-> bladder':>12s}{'-> rectum':>11s}{'-> other':>10s}")
+    for label, suffix in (("whole prostate", ""), ("base third", "_base"), ("middle third", "_mid"),
+                          ("apex third", "_apex")):
+        print(f"  {label:14s}" + "".join(f"{summary[k + suffix + '_mean']:{w}.3f}" for k, w in
+                                          (("recall", 15), ("miss_to_bladder", 12), ("miss_to_rectum", 11),
+                                           ("miss_to_other", 10))))
+    print(f"\nPer patient (the weekly volumes of a patient are not independent: {len(per_patient)} patients are "
+          f"the real sample size)")
+    print(f"  {'patient':8s}{'volumes':>8s}{'prostate':>10s}{'apex':>8s}{'mid':>8s}{'base':>8s}"
+          f"{'pred/true vol':>15s}{'base->bladder':>15s}")
+    for patient, mean in per_patient.items():
+        n = sum(1 for r in rows if r["patient"] == patient)
+        print(f"  {patient:8s}{n:8d}{mean['prostate_dice']:10.3f}{mean['dice_apex']:8.3f}{mean['dice_mid']:8.3f}"
+              f"{mean['dice_base']:8.3f}{mean['volume_ratio']:15.2f}{mean['miss_to_bladder_base']:15.3f}")
+    m, sd = over_patients["prostate_dice"]
+    print(f"  prostate Dice, mean +- std over the {len(per_patient)} patients: {m:.3f} +- {sd:.3f}")
     print(f"\n{summary['seconds_per_volume_mean']:.3f} s per volume for the model call"
           + (f", peak GPU memory {summary['peak_inference_gib']:.2f} GiB" if device.type == "cuda" else ""))
 
@@ -377,8 +451,10 @@ def main(argv=None) -> Dict:
             vol, pred = by_name[row["name"]]
             title = (f"{ckpt['args']['model']}, {args.split}: {row['name']} ({kind} case), prostate Dice "
                      f"{row['dice'][PROSTATE]:.3f} (apex {row['dice_apex']:.2f}, mid {row['dice_mid']:.2f}, "
-                     f"base {row['dice_base']:.2f}); {100 * row['leak_rectum']:.1f}% in rectum, "
-                     f"{100 * row['leak_bladder']:.1f}% in bladder")
+                     f"base {row['dice_base']:.2f})\n"
+                     f"predicted prostate inside true rectum {100 * row['leak_rectum']:.1f}%, bladder "
+                     f"{100 * row['leak_bladder']:.1f}%; true prostate called bladder {100 * row['miss_to_bladder']:.1f}% "
+                     f"(base third {100 * row['miss_to_bladder_base']:.1f}%), rectum {100 * row['miss_to_rectum']:.1f}%")
             fname = f"{kind}_{row['name']}.png"
             if plot_case(out_dir / fname, vol, pred, title):
                 figures.append(fname)
