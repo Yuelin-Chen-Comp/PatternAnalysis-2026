@@ -350,6 +350,21 @@ def test_slice_dataset_items():
     assert "float32" in str(item["image"].dtype) and "int64" in str(item["label"].dtype)
 
 
+def test_volume_dataset_converts_fortran_ordered_volumes_once():
+    """nibabel gives Fortran-ordered arrays, which make the DataLoader's collate copy slow: the dataset must hold
+    C-ordered arrays with unchanged values, leave the caller's volumes alone, and not copy arrays that are fine."""
+    vol = make_volume()
+    f_vol = Volume(vol.name, vol.patient, np.asfortranarray(vol.image), np.asfortranarray(vol.label), vol.spacing)
+    assert f_vol.image.flags["F_CONTIGUOUS"] and not f_vol.image.flags["C_CONTIGUOUS"]
+    ds = dataset.HipMRIVolumeDataset([f_vol, vol])
+    held = ds.volumes[0]
+    assert held.image.flags["C_CONTIGUOUS"] and held.label.flags["C_CONTIGUOUS"]
+    assert np.array_equal(held.image, vol.image) and np.array_equal(held.label, vol.label)
+    assert f_vol.image.flags["F_CONTIGUOUS"] and not f_vol.image.flags["C_CONTIGUOUS"], "the caller's volume is untouched"
+    assert np.shares_memory(ds.volumes[1].image, vol.image), "an already C-ordered array must not be copied"
+    assert held.name == vol.name and held.patient == vol.patient and held.spacing == vol.spacing
+
+
 def make_fake_study(root: Path, cache: Path, n_patients=8, weeks=2):
     """A tiny stand-in for the study: empty .nii.gz files plus a ready-made preprocessed cache, so
     make_datasets runs end to end without nibabel and without any real data."""

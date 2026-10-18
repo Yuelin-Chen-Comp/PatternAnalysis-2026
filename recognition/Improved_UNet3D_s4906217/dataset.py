@@ -40,7 +40,7 @@ import json
 import random
 import re
 import zlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -532,7 +532,11 @@ class HipMRIVolumeDataset(Dataset):
     3D U-Net, see the README), so it is predicted in one pass and no sliding window is needed."""
 
     def __init__(self, volumes: Sequence[Volume]):
-        self.volumes = list(volumes)
+        # nibabel returns Fortran-ordered arrays, and the DataLoader's collate copy of such an array is slow: on a
+        # Rangpur A100 node 0.44 s per volume instead of 0.04 s (scripts/profile_eval.py). Convert once here
+        # (a no-op for arrays that are already C-ordered) rather than once per volume per validation.
+        self.volumes = [replace(v, image=np.ascontiguousarray(v.image), label=np.ascontiguousarray(v.label))
+                        for v in volumes]
 
     def __len__(self) -> int:
         return len(self.volumes)
