@@ -270,6 +270,34 @@ def test_predict_runs_end_to_end_for_all_models():
             assert test_result["figures"] == []
 
 
+def test_summarise_runs_reads_what_predict_writes():
+    """The run-summary script must understand the results.json files of the real predict.py, for all three models."""
+    need(torch is not None)
+    sys.path.insert(0, str(HERE.parent / "scripts"))
+    import contextlib
+    import io
+    import summarise_runs
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        make_fake_study(tmp / "study", tmp / "cache")
+        common = ["--root", str(tmp / "study"), "--cache-dir", str(tmp / "cache"),
+                  "--split-file", str(tmp / "split.json"), "--out-dir", str(tmp / "runs")]
+        for model, name in (("unet2d", "baseline2d"), ("unet3d", "unet3d"), ("improved3d", "improved3d")):
+            train.main(["--model", model, "--name", name, "--epochs", "1", "--val-every", "1", "--samples-per-epoch", "4",
+                        "--batch-size", "2", "--patch", "16", "16", "8", "--base-channels", "4", "--depth", "2",
+                        "--workers", "0", *common])
+            predict.main(["--name", name, "--split", "test", "--no-figures", *common])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            summarise_runs.main(["--split", "test", "--out-dir", str(tmp / "runs")])
+        text = out.getvalue()
+        assert text.count("missing:") == 6, "seeds 1 and 2 of the three models were not run"
+        for label in ("2D U-Net", "3D U-Net", "Improved 3D U-Net"):
+            assert f"| {label} | 1 |" in text, f"no row for {label}"
+        assert "Paired differences per patient" in text and "1 of 1" in text or "0 of 1" in text
+        assert "nan" not in text.lower().replace("n/a", ""), "undefined values must be shown as n/a, not nan"
+
+
 def test_predict_agrees_with_the_scores_of_train_test():
     """predict.py and train.py --test-only must report the same per-class Dice for the same checkpoint."""
     need(torch is not None)
