@@ -51,12 +51,17 @@ CONFIGS = [
     ("3D train whole volume bs1 bf16", "3d", "train", FULL_VOLUME, 1, "bf16"),
     ("2D train slice bs16 bf16", "2d", "train", FULL_VOLUME[:2], 16, "bf16"),
     ("2D train slice bs32 bf16", "2d", "train", FULL_VOLUME[:2], 32, "bf16"),
+    ("Improved 3D train patch bs1 bf16", "improved3d", "train", PATCH, 1, "bf16"),
+    ("Improved 3D train patch bs2 bf16", "improved3d", "train", PATCH, 2, "bf16"),
+    ("Improved 3D train whole volume bs1 bf16", "improved3d", "train", FULL_VOLUME, 1, "bf16"),
     ("3D infer patch bf16", "3d", "infer", PATCH, 1, "bf16"),
     ("3D infer whole volume bf16", "3d", "infer", FULL_VOLUME, 1, "bf16"),
+    ("Improved 3D infer whole volume bf16", "improved3d", "infer", FULL_VOLUME, 1, "bf16"),
     ("2D infer whole volume (slice by slice) bf16", "2d", "infer", FULL_VOLUME, 1, "bf16"),
 ]
 # tiny shapes for --smoke, keyed by (model, mode); a 2D inference row is a small volume of 6 slices
 SMOKE_SIZES = {("3d", "train"): (32, 32, 16), ("3d", "infer"): (32, 32, 16),
+               ("improved3d", "train"): (32, 32, 16), ("improved3d", "infer"): (32, 32, 16),
                ("2d", "train"): (32, 32), ("2d", "infer"): (32, 32, 6)}
 
 
@@ -73,7 +78,20 @@ def stand_in_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 def build_model(kind: str, smoke: bool) -> torch.nn.Module:
     small = {"base_channels": 4, "depth": 2} if smoke else {}
-    return modules.UNet3D(**small) if kind == "3d" else modules.UNet2D(**small)
+    return {"3d": modules.UNet3D, "2d": modules.UNet2D, "improved3d": modules.ImprovedUNet3D}[kind](**small)
+
+
+def step_loss(model: torch.nn.Module, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """The loss of one training step; the Improved U-Net also scores its half- and quarter-resolution maps
+    (deep supervision, weights 0.5 and 0.25 as in train.py), which costs extra memory that must be counted."""
+    if not hasattr(model, "aux_strides"):
+        return stand_in_loss(model(x), y)
+    final, aux = model(x, return_aux=True)
+    weights = (0.5, 0.25)[:len(aux)]
+    total = stand_in_loss(final, y)
+    for weight, scores, stride in zip(weights, aux, model.aux_strides):
+        total = total + weight * stand_in_loss(scores, y[(slice(None),) + (slice(None, None, stride),) * (y.dim() - 1)])
+    return total / (1.0 + sum(weights))
 
 
 def make_scaler(enabled: bool):
@@ -106,7 +124,7 @@ def measure(kind, mode, size, batch, amp, device, steps, smoke):
             t0 = time.perf_counter()
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-                loss = stand_in_loss(model(x), y)
+                loss = step_loss(model, x, y)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()

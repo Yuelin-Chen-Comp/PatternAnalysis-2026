@@ -229,9 +229,9 @@ def test_patient_level_averages_over_patients_not_volumes():
 # the whole pipeline on a fake study
 # ---------------------------------------------------------------------------
 
-def test_predict_runs_end_to_end_for_both_models():
+def test_predict_runs_end_to_end_for_all_models():
     need(torch is not None)
-    for model in ("unet2d", "unet3d"):
+    for model in ("unet2d", "unet3d", "improved3d"):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             make_fake_study(tmp / "study", tmp / "cache")

@@ -181,7 +181,7 @@ def load_model(checkpoint, device):
     saved = ckpt["args"]
     model = train.build_model(saved["model"], saved.get("base_channels"), saved.get("depth")).to(device)
     model.load_state_dict(ckpt["model"])
-    return model.eval(), (2 if saved["model"] == "unet2d" else 3), ckpt
+    return model.eval(), train.model_dim(saved["model"]), ckpt
 
 
 @torch.no_grad()
