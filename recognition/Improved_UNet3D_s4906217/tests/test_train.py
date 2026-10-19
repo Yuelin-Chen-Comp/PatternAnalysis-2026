@@ -38,6 +38,14 @@ def need_torch():
     pytest.skip("torch not installed")
 
 
+def raises(exc, fn, *args, **kwargs):
+    try:
+        fn(*args, **kwargs)
+    except exc:
+        return True
+    return False
+
+
 def base_argv(tmp, model, *extra):
     """A 2-epoch run of a tiny model on the fake study (8 patients -> 6 train / 1 val / 1 test)."""
     tmp = Path(tmp)
@@ -50,7 +58,7 @@ def base_argv(tmp, model, *extra):
 
 def test_pipeline_runs_end_to_end_for_both_models_and_writes_its_outputs():
     need_torch()
-    for model in ("unet2d", "unet3d"):
+    for model in ("unet2d", "unet3d", "improved3d"):
         with tempfile.TemporaryDirectory() as tmp:
             make_fake_study(Path(tmp) / "study", Path(tmp) / "cache")
             run = Path(tmp) / "runs" / "t"
@@ -66,6 +74,8 @@ def test_pipeline_runs_end_to_end_for_both_models_and_writes_its_outputs():
             assert all(h["train_seconds"] > 0 and h["val_seconds"] > 0 for h in history), "per-phase timings are logged"
             config = json.loads((run / "config.json").read_text())
             assert (config["train_patients"], config["train_volumes"], config["val_volumes"]) == (6, 12, 2)
+            # depth 2 gives the improved model one auxiliary output, so the default weights are cut to one
+            assert config["args"]["aux_weights"] == ([0.5] if model == "improved3d" else [])
             assert summary["best_epoch"] in (1, 2)
             best = torch.load(run / "best.pt", map_location="cpu")
             assert best["epoch"] == summary["best_epoch"]
@@ -105,6 +115,83 @@ def test_test_flag_scores_the_best_model_after_training():
         summary = train.main(base_argv(tmp, "unet3d", "--test"))
         assert summary["test"]["n_volumes"] == 2
         assert (Path(tmp) / "runs" / "t" / "test_metrics.json").exists()
+
+
+class StubModel:
+    """Returns fixed score maps so that the weighting of forward_loss can be checked by hand."""
+    aux_strides = [2, 4]
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, image, return_aux=False):
+        self.calls.append(return_aux)
+        final = torch.full((1, 3, 8, 8), 1.0)
+        if not return_aux:
+            return final
+        return final, [torch.full((1, 3, 4, 4), 2.0), torch.full((1, 3, 2, 2), 4.0)]
+
+
+def test_forward_loss_weights_the_auxiliary_outputs_and_subsamples_the_labels():
+    need_torch()
+    seen = []
+
+    def loss_fn(scores, label):
+        seen.append((tuple(scores.shape[2:]), tuple(label.shape[1:])))
+        return scores.float().mean()
+
+    model = StubModel()
+    label = torch.zeros(1, 8, 8, dtype=torch.long)
+    total = train.forward_loss(model, torch.zeros(1, 1, 8, 8), label, loss_fn, aux_weights=(0.5, 0.25))
+    assert abs(float(total) - (1.0 + 0.5 * 2.0 + 0.25 * 4.0) / 1.75) < 1e-6, "weighted sum divided by 1 + sum of the weights"
+    assert seen == [((8, 8), (8, 8)), ((4, 4), (4, 4)), ((2, 2), (2, 2))], "labels are subsampled to the map resolution"
+    plain = StubModel()
+    assert float(train.forward_loss(plain, torch.zeros(1, 1, 8, 8), label, loss_fn)) == 1.0 and plain.calls == [False]
+    assert raises(ValueError, train.forward_loss, StubModel(), torch.zeros(1, 1, 8, 8), label, loss_fn, (1.0, 1.0, 1.0))
+
+
+def test_aux_weights_flag_is_validated_and_can_be_switched_off():
+    need_torch()
+    with tempfile.TemporaryDirectory() as tmp:
+        make_fake_study(Path(tmp) / "study", Path(tmp) / "cache")
+        assert raises(SystemExit, train.main, base_argv(tmp, "unet3d", "--aux-weights", "0.5"))
+        off = train.main(base_argv(tmp, "improved3d", "--aux-weights", "--depth", "3"))
+        config = json.loads((Path(tmp) / "runs" / "t" / "config.json").read_text())
+        assert config["args"]["aux_weights"] == [] and off["best_epoch"] in (1, 2)
+
+
+def toy_segmentation(n=8, size=32):
+    """Images whose bright blob is the label: something a small network can learn in a few steps."""
+    torch.manual_seed(0)
+    image = torch.randn(n, 1, size, size) * 0.2
+    label = torch.zeros(n, size, size, dtype=torch.long)
+    for i in range(n):
+        x, y = torch.randint(4, size - 12, (2,)).tolist()
+        label[i, x:x + 8, y:y + 8] = 1 + i % 2
+        image[i, 0, x:x + 8, y:y + 8] += 1.0 + 1.0 * (i % 2)
+    return image, label
+
+
+def test_improved_unet_with_deep_supervision_learns_a_toy_segmentation():
+    need_torch()
+    image, label = toy_segmentation()
+    torch.manual_seed(0)
+    model = modules.ImprovedUNet(dim=2, num_classes=3, base_channels=4, depth=3)
+    loss_fn = utils.DiceCELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+    first = None
+    for step in range(80):
+        optimizer.zero_grad()
+        loss = train.forward_loss(model.train(), image, label, loss_fn, aux_weights=(0.5, 0.25))
+        loss.backward()
+        optimizer.step()
+        first = float(loss.detach()) if first is None else first
+    final = float(loss.detach())
+    assert final < 0.4 * first, f"loss only went from {first:.3f} to {final:.3f}"
+    model.eval()
+    with torch.no_grad():
+        dice, _ = utils.per_class_scores(model(image).argmax(1), label, 3)
+    assert float(dice[1:].min()) > 0.7, f"Dice after training: {dice.tolist()}"
 
 
 def test_summarise_skips_absent_classes_and_averages_the_rest():

@@ -6,6 +6,7 @@ IoU of each class are computed in 3D. The model with the best validation prostat
 
     python train.py --model unet2d --name baseline2d              # the 2D baseline
     python train.py --model unet3d --name unet3d                  # the 3D U-Net
+    python train.py --model improved3d --name improved3d          # the 3D Improved U-Net (deep supervision)
     python train.py --model unet3d --name unet3d --test-only      # score the saved best model on the test split
 
 The test split is only touched with --test / --test-only, never during training, so no choice
@@ -41,14 +42,25 @@ PROSTATE = dataset.PROSTATE
 # model, data, small helpers
 # ---------------------------------------------------------------------------
 
+MODELS = ("unet2d", "unet3d", "improved3d")
+DEFAULT_AUX_WEIGHTS = (0.5, 0.25)   # losses of the Improved U-Net's half- and quarter-resolution score maps
+
+
 def build_model(name: str, base_channels: Optional[int] = None, depth: Optional[int] = None) -> torch.nn.Module:
-    """'unet2d' or 'unet3d' with the defaults of modules.py unless a width / depth is given."""
+    """'unet2d', 'unet3d' or 'improved3d' with the defaults of modules.py unless a width / depth is given."""
     kwargs = {k: v for k, v in (("base_channels", base_channels), ("depth", depth)) if v is not None}
     if name == "unet2d":
         return modules.UNet2D(**kwargs)
     if name == "unet3d":
         return modules.UNet3D(**kwargs)
+    if name == "improved3d":
+        return modules.ImprovedUNet3D(**kwargs)
     raise ValueError(f"unknown model {name!r}")
+
+
+def model_dim(name: str) -> int:
+    """2 for the slice-by-slice baseline, 3 for the models that see whole patches."""
+    return 2 if name == "unet2d" else 3
 
 
 def autocast_dtype(amp: str):
@@ -90,7 +102,27 @@ def write_json(path: Path, obj) -> None:
 # training and evaluation
 # ---------------------------------------------------------------------------
 
-def train_one_epoch(model, loader, loss_fn, optimizer, scaler, device, amp_dtype, grad_clip) -> float:
+def forward_loss(model, image, label, loss_fn, aux_weights=()):
+    """The training loss of one batch.
+
+    With aux_weights (the Improved U-Net's deep supervision) the lower-resolution score maps that the model returns
+    next to its final output are scored too, against the labels subsampled to their resolution (every stride-th
+    voxel: the stride-2 convolutions put output voxel j at input voxel 2j), and the weighted sum is divided by the
+    sum of the weights so that the loss keeps the scale of a single Dice + cross-entropy.
+    """
+    if not aux_weights:
+        return loss_fn(model(image), label)
+    final, aux = model(image, return_aux=True)
+    if len(aux_weights) > len(aux):
+        raise ValueError(f"{len(aux_weights)} auxiliary weights for a model with {len(aux)} auxiliary outputs")
+    total = loss_fn(final, label)
+    for weight, scores, stride in zip(aux_weights, aux, model.aux_strides):
+        subsampled = label[(slice(None),) + (slice(None, None, stride),) * (label.dim() - 1)]
+        total = total + weight * loss_fn(scores, subsampled)
+    return total / (1.0 + sum(aux_weights))
+
+
+def train_one_epoch(model, loader, loss_fn, optimizer, scaler, device, amp_dtype, grad_clip, aux_weights=()) -> float:
     """One pass over `loader`; returns the mean training loss per sample."""
     model.train()
     total, count = 0.0, 0
@@ -99,7 +131,7 @@ def train_one_epoch(model, loader, loss_fn, optimizer, scaler, device, amp_dtype
         label = batch["label"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-            loss = loss_fn(model(image), label)
+            loss = forward_loss(model, image, label, loss_fn, aux_weights)
         scaler.scale(loss).backward()
         if grad_clip:
             scaler.unscale_(optimizer)   # clip the real gradients, not the loss-scaled ones
@@ -188,7 +220,7 @@ def run_test(run_dir: Path, args, device, amp_dtype) -> Dict:
     saved = checkpoint["args"]
     model = build_model(saved["model"], saved.get("base_channels"), saved.get("depth")).to(device)
     model.load_state_dict(checkpoint["model"])
-    dim = 2 if saved["model"] == "unet2d" else 3
+    dim = model_dim(saved["model"])
     test_set = dataset.make_datasets(args.root, args.split_file, which=("test",), cache_dir=args.cache_dir,
                                      max_cases_per_split=args.max_cases_per_split, dim=dim)["test"]
     loader = DataLoader(test_set, batch_size=1, shuffle=False, num_workers=0)
@@ -215,7 +247,7 @@ def run_test(run_dir: Path, args, device, amp_dtype) -> Dict:
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", choices=("unet2d", "unet3d"), required=True)
+    ap.add_argument("--model", choices=MODELS, required=True)
     ap.add_argument("--name", default=None, help="run name (default: the model name)")
     ap.add_argument("--root", default=dataset.DEFAULT_ROOT)
     ap.add_argument("--split-file", default=str(dataset.DEFAULT_SPLIT_FILE))
@@ -230,6 +262,9 @@ def parse_args(argv=None):
     ap.add_argument("--weight-decay", type=float, default=1e-5)
     ap.add_argument("--grad-clip", type=float, default=12.0, help="max gradient norm (0 = off)")
     ap.add_argument("--amp", choices=("bf16", "fp16", "none"), default=None, help="default bf16 on a GPU, none on a CPU")
+    ap.add_argument("--aux-weights", type=float, nargs="*", default=None,
+                    help="deep supervision: loss weights of the improved3d model's half- and quarter-resolution maps "
+                         "(default 0.5 0.25; give none, i.e. '--aux-weights', to switch it off)")
     ap.add_argument("--val-every", type=int, default=2, help="validate every N epochs")
     ap.add_argument("--base-channels", type=int, default=None)
     ap.add_argument("--depth", type=int, default=None)
@@ -248,8 +283,10 @@ def main(argv=None) -> Dict:
     if args.amp is None:
         args.amp = "bf16" if device.type == "cuda" else "none"
     amp_dtype = autocast_dtype(args.amp)
-    dim = 2 if args.model == "unet2d" else 3
+    dim = model_dim(args.model)
     batch_size = args.batch_size or (16 if dim == 2 else 2)
+    if args.aux_weights and args.model != "improved3d":
+        raise SystemExit("--aux-weights only applies to --model improved3d")
     run_dir = Path(args.out_dir) / (args.name or args.model)
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -270,6 +307,8 @@ def main(argv=None) -> Dict:
     val_loader = DataLoader(sets["val"], batch_size=1, shuffle=False, num_workers=0)
 
     model = build_model(args.model, args.base_channels, args.depth).to(device)
+    if args.aux_weights is None:   # the default weights, as many as this model has auxiliary outputs
+        args.aux_weights = list(DEFAULT_AUX_WEIGHTS[:len(model.aux_strides)]) if args.model == "improved3d" else []
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     scaler = make_scaler(args.amp == "fp16" and device.type == "cuda")
@@ -290,7 +329,8 @@ def main(argv=None) -> Dict:
     started = time.perf_counter()
     for epoch in range(1, args.epochs + 1):
         t0 = time.perf_counter()
-        train_loss = train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, amp_dtype, args.grad_clip)
+        train_loss = train_one_epoch(model, train_loader, loss_fn, optimizer, scaler, device, amp_dtype, args.grad_clip,
+                                     args.aux_weights)
         entry = {"epoch": epoch, "train_loss": train_loss, "lr": optimizer.param_groups[0]["lr"],
                  "train_seconds": time.perf_counter() - t0}
         scheduler.step()
