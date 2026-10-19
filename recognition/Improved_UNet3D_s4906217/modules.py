@@ -1,13 +1,13 @@
 """Model components for HipMRI prostate segmentation (PyTorch only, no NumPy).
 
-This file holds the two models the study compares:
+This file holds the three models the study compares:
 
-    UNet2D   the baseline: a 2D U-Net (Ronneberger et al., 2015) run on axial slices
-    UNet3D   a plain 3D U-Net (Cicek et al., 2016) run on 3D patches
+    UNet2D           the baseline: a 2D U-Net (Ronneberger et al., 2015) run on axial slices
+    UNet3D           a plain 3D U-Net (Cicek et al., 2016) run on 3D patches
+    ImprovedUNet3D   the 3D Improved U-Net (Isensee et al., 2018): residual context modules, localisation
+                     modules and deep supervision (see ImprovedUNet below)
 
-The 3D Improved U-Net (Isensee et al., 2018) will be built from the same blocks.
-
-Both models are the same class, UNet, with dim = 2 or 3. They share ConvBlock, Down and Up,
+UNet2D and UNet3D are the same class, UNet, with dim = 2 or 3. They share ConvBlock, Down and Up,
 so the only thing that differs between the baseline and the 3D model is the dimensionality:
 a difference in Dice or memory cannot come from different normalisation or activations.
 
@@ -38,6 +38,7 @@ _CONV_TRANSPOSE = {2: nn.ConvTranspose2d, 3: nn.ConvTranspose3d}
 _MAX_POOL = {2: nn.MaxPool2d, 3: nn.MaxPool3d}
 _INSTANCE_NORM = {2: nn.InstanceNorm2d, 3: nn.InstanceNorm3d}
 _BATCH_NORM = {2: nn.BatchNorm2d, 3: nn.BatchNorm3d}
+_DROPOUT = {2: nn.Dropout2d, 3: nn.Dropout3d}
 
 
 def _check_dim(dim: int) -> None:
@@ -179,6 +180,124 @@ class UNet3D(UNet):
     def __init__(self, in_channels: int = 1, num_classes: int = 6, base_channels: int = 16,
                  depth: int = 4, norm: str = "instance"):
         super().__init__(3, in_channels, num_classes, base_channels, depth, norm)
+
+
+# ---------------------------------------------------------------------------
+# The Improved U-Net (Isensee et al., 2018)
+# ---------------------------------------------------------------------------
+
+def _conv_norm_act(in_channels: int, out_channels: int, dim: int, kernel: int = 3, stride: int = 1) -> nn.Sequential:
+    """Convolution -> instance norm -> LeakyReLU; the stride-2 version is the learned downsampling."""
+    return nn.Sequential(
+        _CONV[dim](in_channels, out_channels, kernel_size=kernel, stride=stride, padding=kernel // 2, bias=False),
+        _INSTANCE_NORM[dim](out_channels, affine=True),
+        nn.LeakyReLU(0.01, inplace=True))
+
+
+class ContextModule(nn.Module):
+    """Pre-activation residual block: (norm, LeakyReLU, 3x3(x3) conv) twice with a dropout in between, and the
+    input added to the result.
+
+    The identity path lets the gradient reach the early layers directly, which is what makes a deeper network
+    trainable on so little data; the dropout (over whole feature maps) regularises it. The module keeps the
+    number of channels and the spatial size.
+    """
+
+    def __init__(self, channels: int, dim: int = 3, dropout: float = 0.3):
+        super().__init__()
+        _check_dim(dim)
+        norm = _INSTANCE_NORM[dim]
+        self.block = nn.Sequential(
+            norm(channels, affine=True), nn.LeakyReLU(0.01, inplace=True),
+            _CONV[dim](channels, channels, kernel_size=3, padding=1, bias=False),
+            _DROPOUT[dim](dropout),
+            norm(channels, affine=True), nn.LeakyReLU(0.01, inplace=True),
+            _CONV[dim](channels, channels, kernel_size=3, padding=1, bias=False))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.block(x)
+
+
+class ImprovedUNet(nn.Module):
+    """The Improved U-Net of Isensee et al. (2018), for dim = 3 (the model of this study) or dim = 2.
+
+    Context pathway (encoder). A 3x3x3 convolution, then at every level a ContextModule; between levels a
+    3x3x3 convolution with stride 2 (a learned downsampling, instead of max-pooling) that doubles the channels.
+
+    Localisation pathway (decoder). Upsample by repeating the voxels (nearest neighbour), a 3x3x3 convolution that
+    halves the channels, concatenate the context features of that level, then a localisation module: a 3x3x3
+    convolution followed by a 1x1x1 convolution.
+
+    Deep supervision. The last `deep_levels` localisation outputs each get a 1x1x1 convolution to class scores
+    (a segmentation layer). The coarsest of them is upsampled and added to the next one, and so on up to the full
+    resolution, so the final logits are the sum of the scores of several scales and the lower levels receive a
+    short gradient path straight from the loss. With return_aux = True the lower-resolution score maps are also
+    returned (highest resolution first, strides in self.aux_strides) so that they can be given a loss of their own.
+
+    Every spatial size of the input should be at least 2**depth, and the bottleneck must hold more than one
+    voxel (instance norm cannot normalise a single value). Other sizes work: the upsampling is done to the
+    exact size of the skip connection.
+    """
+
+    def __init__(self, dim: int = 3, in_channels: int = 1, num_classes: int = 6, base_channels: int = 16,
+                 depth: int = 4, deep_levels: int = 3, dropout: float = 0.3):
+        super().__init__()
+        _check_dim(dim)
+        if depth < 1:
+            raise ValueError(f"depth must be at least 1, got {depth}")
+        if deep_levels < 1:
+            raise ValueError(f"deep_levels must be at least 1, got {deep_levels}")
+        self.dim = dim
+        self.depth = depth
+        channels = [base_channels * 2 ** level for level in range(depth + 1)]
+
+        self.stem = _CONV[dim](in_channels, channels[0], kernel_size=3, padding=1, bias=False)
+        self.context = nn.ModuleList(ContextModule(c, dim, dropout) for c in channels)
+        self.downs = nn.ModuleList(_conv_norm_act(channels[i], channels[i + 1], dim, stride=2) for i in range(depth))
+
+        levels = list(reversed(range(depth)))   # the decoder works from level depth-1 up to level 0
+        self.ups = nn.ModuleList(_conv_norm_act(channels[i + 1], channels[i], dim) for i in levels)
+        self.localise = nn.ModuleList(
+            nn.Sequential(_conv_norm_act(2 * channels[i], channels[i], dim),
+                          _conv_norm_act(channels[i], channels[i], dim, kernel=1)) for i in levels)
+
+        # segmentation layers on the last `deep_levels` localisation outputs, coarsest first
+        self.head_levels = list(range(min(deep_levels, depth) - 1, -1, -1))
+        self.heads = nn.ModuleList(_CONV[dim](channels[i], num_classes, kernel_size=1) for i in self.head_levels)
+        self.aux_strides = [2 ** i for i in sorted(self.head_levels) if i > 0]   # of the maps returned as aux
+        self.apply(init_weights)
+
+    def forward(self, x: torch.Tensor, return_aux: bool = False):
+        if x.dim() != self.dim + 2:
+            raise ValueError(f"a {self.dim}D ImprovedUNet expects (B, C{', X, Y, Z' if self.dim == 3 else ', X, Y'}) "
+                             f"input, got shape {tuple(x.shape)}")
+        h = self.context[0](self.stem(x))
+        skips = [h]
+        for down, context in zip(self.downs, self.context[1:]):
+            h = context(down(h))
+            skips.append(h)
+
+        localised = {}
+        for up, localise, level in zip(self.ups, self.localise, reversed(range(self.depth))):
+            h = F.interpolate(h, size=skips[level].shape[2:], mode="nearest")
+            h = localise(torch.cat([skips[level], up(h)], dim=1))
+            localised[level] = h
+
+        total, aux = None, []
+        for head, level in zip(self.heads, self.head_levels):   # from the coarsest to the full resolution
+            scores = head(localised[level])
+            if level > 0:
+                aux.append(scores)
+            total = scores if total is None else F.interpolate(total, size=scores.shape[2:], mode="nearest") + scores
+        return (total, aux[::-1]) if return_aux else total
+
+
+class ImprovedUNet3D(ImprovedUNet):
+    """The 3D Improved U-Net of this study: 16 base channels, five levels, three segmentation layers."""
+
+    def __init__(self, in_channels: int = 1, num_classes: int = 6, base_channels: int = 16, depth: int = 4,
+                 deep_levels: int = 3, dropout: float = 0.3):
+        super().__init__(3, in_channels, num_classes, base_channels, depth, deep_levels, dropout)
 
 
 # ---------------------------------------------------------------------------

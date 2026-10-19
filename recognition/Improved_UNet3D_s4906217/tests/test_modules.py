@@ -136,6 +136,133 @@ def test_count_parameters():
 
 
 # ---------------------------------------------------------------------------
+# the Improved U-Net
+# ---------------------------------------------------------------------------
+
+def tiny_improved(dim=3, depth=3, **kwargs):
+    torch.manual_seed(0)
+    return modules.ImprovedUNet(dim=dim, base_channels=4, depth=depth, **kwargs)
+
+
+def test_improved_output_shapes_in_3d_and_2d():
+    need_torch()
+    torch.manual_seed(0)
+    y3 = modules.ImprovedUNet3D(base_channels=4, depth=2)(torch.randn(2, 1, 16, 16, 8))
+    assert tuple(y3.shape) == (2, 6, 16, 16, 8)
+    y2 = tiny_improved(dim=2)(torch.randn(2, 1, 32, 32))
+    assert tuple(y2.shape) == (2, 6, 32, 32)
+    y = tiny_improved(num_classes=3, in_channels=2)(torch.randn(1, 2, 16, 16, 8))
+    assert tuple(y.shape) == (1, 3, 16, 16, 8)
+
+
+def test_improved_keeps_the_size_of_odd_inputs():
+    need_torch()
+    assert tuple(tiny_improved()(torch.randn(1, 1, 30, 26, 18)).shape) == (1, 6, 30, 26, 18)
+    assert tuple(tiny_improved(dim=2)(torch.randn(1, 1, 31, 23)).shape) == (1, 6, 31, 23)
+
+
+def test_improved_aux_maps_have_the_size_of_the_strided_labels():
+    need_torch()
+    model = tiny_improved()
+    assert model.head_levels == [2, 1, 0] and model.aux_strides == [2, 4]
+    for shape in ((16, 16, 8), (30, 26, 18)):
+        x = torch.randn(1, 1, *shape)
+        final, aux = model(x, return_aux=True)
+        assert tuple(final.shape[2:]) == shape and len(aux) == 2
+        label = torch.zeros(1, *shape)
+        for scores, stride in zip(aux, model.aux_strides):
+            expected = label[:, ::stride, ::stride, ::stride].shape[1:]   # what the loss is compared with
+            assert tuple(scores.shape[2:]) == tuple(expected), (shape, stride, tuple(scores.shape[2:]), tuple(expected))
+    assert torch.equal(model.eval()(x), model(x, return_aux=True)[0]), "return_aux must not change the final output"
+
+
+def test_improved_deep_levels_are_clamped_and_arguments_checked():
+    need_torch()
+    assert modules.ImprovedUNet(dim=3, base_channels=4, depth=2, deep_levels=3).head_levels == [1, 0]
+    assert modules.ImprovedUNet(dim=3, base_channels=4, depth=3, deep_levels=1).aux_strides == []
+    assert raises(ValueError, modules.ImprovedUNet, dim=4)
+    assert raises(ValueError, modules.ImprovedUNet, dim=3, depth=0)
+    assert raises(ValueError, modules.ImprovedUNet, dim=3, deep_levels=0)
+    assert raises(ValueError, tiny_improved(), torch.randn(1, 1, 16, 16))
+
+
+def test_context_module_is_a_residual_block():
+    need_torch()
+    torch.manual_seed(0)
+    module = modules.ContextModule(4, dim=3).eval()
+    x = torch.randn(1, 4, 8, 8, 8)
+    assert not torch.allclose(module(x), x)
+    for p in module.parameters():
+        torch.nn.init.zeros_(p)
+    assert torch.allclose(module(x), x), "with the residual branch switched off the block must be the identity"
+
+
+def test_improved_dropout_is_active_in_training_only():
+    need_torch()
+    model = tiny_improved()
+    x = torch.randn(1, 1, 16, 16, 8)
+    model.train()
+    assert not torch.allclose(model(x), model(x)), "dropout must make two training passes differ"
+    model.eval()
+    assert torch.equal(model(x), model(x)), "evaluation must be deterministic"
+
+
+def test_improved_gradients_reach_every_parameter():
+    need_torch()
+    model = tiny_improved()
+    x = torch.randn(1, 1, 16, 16, 8)
+    target = torch.randint(0, 6, (1, 16, 16, 8))
+    torch.nn.functional.cross_entropy(model(x), target).backward()   # the final output alone
+    for name, p in model.named_parameters():
+        assert p.grad is not None and bool(torch.isfinite(p.grad).all()), f"bad gradient for {name}"
+    assert float(model.stem.weight.grad.abs().sum()) > 0, "the gradient reaches the first convolution"
+
+
+def test_improved_skip_connections_carry_the_input_past_the_bottleneck():
+    """Cut the deep path (the first down-sampling convolution gets zero weights, so everything below it is exactly
+    zero): the output can then only depend on the input through the skip connections."""
+    need_torch()
+    model = tiny_improved().eval()
+    x1, x2 = torch.randn(1, 1, 16, 16, 8), torch.randn(1, 1, 16, 16, 8)
+    with torch.no_grad():
+        assert not torch.allclose(model(x1), model(x2)), "sanity: different inputs give different outputs"
+        model.downs[0][0].weight.zero_()
+        assert not torch.allclose(model(x1), model(x2)), "with the deep path cut, the skips must still carry the input"
+
+
+def test_every_segmentation_layer_contributes_to_the_final_output():
+    need_torch()
+    model = tiny_improved().eval()
+    x = torch.randn(1, 1, 16, 16, 8)
+    with torch.no_grad():
+        reference = model(x)
+        for i, head in enumerate(model.heads):
+            saved = [p.clone() for p in head.parameters()]
+            for p in head.parameters():
+                p.zero_()
+            assert not torch.allclose(model(x), reference), f"segmentation layer {i} does not reach the output"
+            for p, old in zip(head.parameters(), saved):
+                p.copy_(old)
+        assert torch.equal(model(x), reference)
+
+
+def test_the_final_output_is_the_sum_of_the_upsampled_scales():
+    need_torch()
+    model = tiny_improved().eval()
+    x = torch.randn(1, 1, 16, 16, 8)
+    captured = {}
+    handle = model.heads[0].register_forward_hook(lambda m, i, out: captured.setdefault("coarse", out.detach().clone()))
+    with torch.no_grad():
+        for head in model.heads[1:]:                     # keep only the coarsest segmentation layer
+            for p in head.parameters():
+                p.zero_()
+        final = model(x)
+    handle.remove()
+    expected = torch.nn.functional.interpolate(captured["coarse"], size=final.shape[2:], mode="nearest")
+    assert torch.allclose(final, expected), "the coarse scores must be upsampled by repetition and summed"
+
+
+# ---------------------------------------------------------------------------
 # the 2D baseline on 3D volumes
 # ---------------------------------------------------------------------------
 
