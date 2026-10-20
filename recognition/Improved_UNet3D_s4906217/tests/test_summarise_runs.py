@@ -17,11 +17,13 @@ import summarise_runs as sr  # noqa: E402
 PATIENTS = ("A001", "B002")
 
 
-def results(prostate_by_patient, volume_dice=None):
-    """A minimal results.json: only the fields that summarise_runs reads."""
+def results(prostate_by_patient, volume_dice=None, volumes=None):
+    """A minimal results.json: only the fields that summarise_runs reads. `volumes` maps a volume name to
+    (patient, prostate Dice) and adds the per-volume rows."""
     mean = sum(prostate_by_patient.values()) / len(prostate_by_patient)
     dice = volume_dice if volume_dice is not None else mean
-    return {"split": "test", "summary": {
+    rows = [{"name": n, "patient": pt, "dice": [0.9, 0.9, 0.9, 0.9, 0.9, d]} for n, (pt, d) in (volumes or {}).items()]
+    return {"split": "test", "volumes": rows, "summary": {
         "n_volumes": 4, "dice_mean": [0.99, 0.98, 0.9, 0.9, 0.85, dice], "iou_mean": [0.9] * 6,
         "patient_level": {"prostate_dice": {"mean": mean, "std": 0.0}},
         "per_patient": {p: {"prostate_dice": v, "dice_apex": v - 0.02, "dice_mid": v + 0.02, "dice_base": v - 0.04}
@@ -90,6 +92,46 @@ def test_per_patient_table_and_paired_differences():
         assert "+0.060" in row and "+0.020 to +0.100" in row and "2 of 2" in row, row   # mean of +0.10 and +0.02
         base = next(l for l in text.splitlines() if l.startswith("| 3D U-Net - 2D U-Net | base third |"))
         assert "+0.060" in base, "the thirds are compared the same way"
+
+
+def test_median_seed_and_per_run_table():
+    with tempfile.TemporaryDirectory() as tmp:
+        make_study(tmp)       # 2D volume-level Dice 0.75, 0.77, 0.73 for seeds 0, 1, 2: the median seed is seed 0
+        text = run_main(tmp)
+        assert "**Every run: prostate Dice on this split**" in text
+        rows = {l.split("|")[2].strip(): l for l in text.splitlines() if l.startswith("| 2D U-Net | baseline2d")}
+        assert set(rows) == {"baseline2d", "baseline2d_s1", "baseline2d_s2"}
+        assert "median seed" in rows["baseline2d"] and "0.7500" in rows["baseline2d"]
+        assert "median seed" not in rows["baseline2d_s1"] and "median seed" not in rows["baseline2d_s2"]
+        # 3D: 0.80, 0.82, 0.78 -> the median is again seed 0
+        assert any(l.startswith("| 3D U-Net | unet3d |") and "median seed" in l for l in text.splitlines())
+    runs = [{"summary": {"dice_mean": [0, 0, 0, 0, 0, d]}, "_run": n} for n, d in (("a", 0.9), ("b", 0.7), ("c", 0.8), ("d", 0.6))]
+    assert sr.median_run(runs)["_run"] == "b", "the lower middle run for an even number of seeds"
+
+
+def test_hardest_volumes_are_ranked_over_all_runs_and_models():
+    vols = {"a_week0": ("A001", 0.90), "a_week1": ("A001", 0.60), "b_week0": ("B002", 0.80), "b_week1": ("B002", 0.70)}
+    with tempfile.TemporaryDirectory() as tmp:
+        for model, shift in (("baseline2d", 0.00), ("unet3d", 0.02), ("improved3d", 0.04)):
+            for seed, k in (("", 0.00), ("_s1", 0.01), ("_s2", -0.01)):   # seed 0 is the median seed of every model
+                write_run(tmp, f"{model}{seed}", "test",
+                          results({"A001": 0.75 + k, "B002": 0.75 + k}, volumes={n: (p, d + shift) for n, (p, d) in vols.items()}))
+        text = run_main(tmp)
+        assert "hardest on average" in text
+        hard = [l for l in text.splitlines() if l.startswith("| a_week1 |") or l.startswith("| b_week1 |")]
+        assert len(hard) == 2 and hard[0].startswith("| a_week1 |"), "the lowest Dice comes first"
+        # a_week1: 0.60, 0.62, 0.64 for the three models, so 0.620 over all nine runs
+        assert "| A001 | 0.620 | 0.600 | 0.620 | 0.640 |" in hard[0], hard[0]
+        assert "| B002 | 0.720 | 0.700 | 0.720 | 0.740 |" in hard[1], hard[1]
+        # the suggested commands use the median seed of each model (seed 0 here) and the four hardest volumes
+        assert "sbatch predict_job.sh baseline2d --split test --volumes a_week1,b_week1,b_week0,a_week0" in text
+        assert "sbatch predict_job.sh improved3d --split test --volumes a_week1,b_week1,b_week0,a_week0" in text
+
+
+def test_hardest_volumes_are_skipped_when_the_files_have_no_volume_rows():
+    with tempfile.TemporaryDirectory() as tmp:
+        make_study(tmp)       # these hand-made files carry no per-volume rows
+        assert "hardest on average" not in run_main(tmp)
 
 
 def test_no_results_at_all_is_an_error():

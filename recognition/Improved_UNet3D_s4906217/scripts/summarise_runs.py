@@ -30,7 +30,9 @@ def load_runs(out_dir: Path, split: str):
         for seed in SEEDS:
             path = out_dir / f"{prefix}{seed}" / f"predict_{split}" / "results.json"
             if path.exists():
-                runs[label].append(json.loads(path.read_text()))
+                data = json.loads(path.read_text())
+                data["_run"] = f"{prefix}{seed}"
+                runs[label].append(data)
             else:
                 missing.append(str(path))
     return runs, missing
@@ -77,6 +79,28 @@ def per_patient_mean(res, key):
     """{patient: mean over the seeds of the patient-level value of `key`}."""
     patients = sorted(res[0]["summary"]["per_patient"])
     return {p: mean_std([r["summary"]["per_patient"][p][key] for r in res])[0] for p in patients}
+
+
+def median_run(res):
+    """The run whose prostate Dice (mean over volumes) is the median of the seeds (the lower middle one for an even count)."""
+    ordered = sorted(res, key=lambda r: r["summary"]["dice_mean"][PROSTATE])
+    return ordered[(len(ordered) - 1) // 2]
+
+
+def hardest_volumes(runs, k=5):
+    """The k volumes with the lowest prostate Dice averaged over all runs of all models, with the mean per model.
+    Only volumes that every available run has are considered. Returns [] if the files carry no per-volume rows."""
+    per_volume = {}   # name -> {"patient": ..., model label: [Dice of each seed]}
+    for label, res in runs.items():
+        for r in res:
+            for v in r.get("volumes", []):
+                entry = per_volume.setdefault(v["name"], {"patient": v["patient"]})
+                entry.setdefault(label, []).append(v["dice"][PROSTATE])
+    labels = [label for label, res in runs.items() if res]
+    complete = {n: e for n, e in per_volume.items() if all(label in e for label in labels)}
+    ranked = sorted(complete.items(), key=lambda item: statistics.mean(clean([d for l in labels for d in item[1][l]]) or [math.nan]))
+    return [(name, e["patient"], statistics.mean([d for l in labels for d in e[l]]),
+             {l: statistics.mean(e[l]) for l in labels}) for name, e in ranked[:k]]
 
 
 def main(argv=None):
@@ -126,6 +150,27 @@ def main(argv=None):
             row.append(f"{per_patient_mean(res, 'prostate_dice')[p]:.3f}")
         rows.append(row)
     print(f"**Prostate Dice per patient (mean over the seeds)**\n\n{table(['Patient'] + list(available), rows)}\n")
+
+    rows = []
+    for label, res in available.items():
+        median = median_run(res)
+        for r in sorted(res, key=lambda r: r["_run"]):
+            rows.append([label, r["_run"], f"{r['summary']['dice_mean'][PROSTATE]:.4f}",
+                         f"{r['summary']['patient_level']['prostate_dice']['mean']:.4f}",
+                         "median seed" if r is median else ""])
+    print("**Every run: prostate Dice on this split**\n\n"
+          + table(["Model", "run", "over volumes", "over patients", ""], rows) + "\n")
+
+    hardest = hardest_volumes(available)
+    if hardest:
+        rows = [[name, patient, f"{mean:.3f}"] + [f"{per[l]:.3f}" for l in available] for name, patient, mean, per in hardest]
+        print("**The volumes that are hardest on average (prostate Dice averaged over all runs and models)**\n\n"
+              + table(["Volume", "Patient", "mean of all runs"] + [f"{l} (mean over seeds)" for l in available], rows) + "\n")
+        names = ",".join(name for name, *_ in hardest[:4])
+        print("To draw the same volumes for every model, from the median seed of each (in `scripts/`):\n")
+        for label, res in available.items():
+            print(f"    sbatch predict_job.sh {median_run(res)['_run']} --split {args.split} --volumes {names}")
+        print()
 
     labels = list(available)
     pairs = [(a, b) for a, b in (("3D U-Net", "2D U-Net"), ("Improved 3D U-Net", "3D U-Net"),
