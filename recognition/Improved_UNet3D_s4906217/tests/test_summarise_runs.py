@@ -109,29 +109,44 @@ def test_median_seed_and_per_run_table():
     assert sr.median_run(runs)["_run"] == "b", "the lower middle run for an even number of seeds"
 
 
-def test_hardest_volumes_are_ranked_over_all_runs_and_models():
-    vols = {"a_week0": ("A001", 0.90), "a_week1": ("A001", 0.60), "b_week0": ("B002", 0.80), "b_week1": ("B002", 0.70)}
+def test_hardest_volume_of_each_patient_is_ranked_over_all_runs_and_models():
+    # patient A001 has two volumes, B002 two, C003 only one; a_week1 is the hardest volume of A001, b_week1 of B002
+    vols = {"a_week0": ("A001", 0.90), "a_week1": ("A001", 0.60), "b_week0": ("B002", 0.80), "b_week1": ("B002", 0.70),
+            "c_week0": ("C003", 0.95)}
     with tempfile.TemporaryDirectory() as tmp:
         for model, shift in (("baseline2d", 0.00), ("unet3d", 0.02), ("improved3d", 0.04)):
             for seed, k in (("", 0.00), ("_s1", 0.01), ("_s2", -0.01)):   # seed 0 is the median seed of every model
                 write_run(tmp, f"{model}{seed}", "test",
                           results({"A001": 0.75 + k, "B002": 0.75 + k}, volumes={n: (p, d + shift) for n, (p, d) in vols.items()}))
         text = run_main(tmp)
-        assert "hardest on average" in text
-        hard = [l for l in text.splitlines() if l.startswith("| a_week1 |") or l.startswith("| b_week1 |")]
-        assert len(hard) == 2 and hard[0].startswith("| a_week1 |"), "the lowest Dice comes first"
-        # a_week1: 0.60, 0.62, 0.64 for the three models, so 0.620 over all nine runs
-        assert "| A001 | 0.620 | 0.600 | 0.620 | 0.640 |" in hard[0], hard[0]
-        assert "| B002 | 0.720 | 0.700 | 0.720 | 0.740 |" in hard[1], hard[1]
-        # the suggested commands use the median seed of each model (seed 0 here) and the four hardest volumes
-        assert "sbatch predict_job.sh baseline2d --split test --volumes a_week1,b_week1,b_week0,a_week0" in text
-        assert "sbatch predict_job.sh improved3d --split test --volumes a_week1,b_week1,b_week0,a_week0" in text
+        assert "The hardest volume of each patient" in text
+        rows = [l for l in text.splitlines() if l.startswith(("| a_week1 |", "| b_week1 |", "| c_week0 |"))]
+        assert [r.split("|")[1].strip() for r in rows] == ["a_week1", "b_week1", "c_week0"], "hardest patient first"
+        assert not any(l.startswith(("| a_week0 |", "| b_week0 |")) for l in text.splitlines()), "one volume per patient"
+        # a_week1: 0.60, 0.62, 0.64 for the three models, so 0.620 over all nine runs; the patient has 2 volumes
+        assert "| a_week1 | A001 | 2 | 0.620 | 0.600 | 0.620 | 0.640 |" in rows[0], rows[0]
+        assert "| b_week1 | B002 | 2 | 0.720 | 0.700 | 0.720 | 0.740 |" in rows[1], rows[1]
+        assert "| c_week0 | C003 | 1 | 0.970 | 0.950 | 0.970 | 0.990 |" in rows[2], "a patient with a single volume is shown with 1"
+        # the suggested commands use the median seed of each model (seed 0 here) and the hardest volumes of the patients
+        assert "sbatch predict_job.sh baseline2d --split test --volumes a_week1,b_week1,c_week0" in text
+        assert "sbatch predict_job.sh improved3d --split test --volumes a_week1,b_week1,c_week0" in text
 
 
-def test_hardest_volumes_are_skipped_when_the_files_have_no_volume_rows():
+def test_a_volume_that_not_every_run_has_is_not_considered():
+    with tempfile.TemporaryDirectory() as tmp:
+        for model in ("baseline2d", "unet3d", "improved3d"):
+            vols = {"a_week0": ("A001", 0.9), "a_week1": ("A001", 0.8)}
+            if model == "improved3d":
+                vols.pop("a_week1")            # this model's file lacks a_week1
+            write_run(tmp, model, "test", results({"A001": 0.85}, volumes=vols))
+        text = run_main(tmp)
+        assert "| a_week0 | A001 | 1 |" in text and "a_week1" not in text
+
+
+def test_the_hardest_section_is_skipped_when_the_files_have_no_volume_rows():
     with tempfile.TemporaryDirectory() as tmp:
         make_study(tmp)       # these hand-made files carry no per-volume rows
-        assert "hardest on average" not in run_main(tmp)
+        assert "The hardest volume of each patient" not in run_main(tmp)
 
 
 def test_no_results_at_all_is_an_error():
