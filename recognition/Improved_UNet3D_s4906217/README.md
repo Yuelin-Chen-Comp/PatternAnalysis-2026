@@ -529,6 +529,45 @@ the rows are the axial base, middle and apex slices and a sagittal plane, the co
 prediction and difference (green = correct prostate, blue = missed, red = false prostate, yellow = false prostate inside
 the true rectum or bladder). The triggers named below are the likely causes from the images; they were not tested.
 
+**How to read a figure.** The annotated example below is the 2D U-Net on `t014_week2` (case 1 and 2). Each figure has four
+rows (three axial slices near the base, in the middle and near the apex of the prostate, and one sagittal side view)
+and four columns (the MRI slice, the annotated contour, the model's prediction, and their difference). The title gives
+the Dice of the prostate and of its three thirds, the share of the predicted prostate that lies in the true rectum
+and bladder, and the share of the true prostate that was called bladder or rectum. In the difference column mostly
+green is good, a blue rim all around means that the contour is too small, a red rim that it is too wide, a blue blob that
+part of the prostate was missed, and yellow that the prediction runs into the bladder or rectum.
+
+![How to read a case figure: rows, columns, colours and three examples](images/how_to_read_a_case_figure.png)
+
+**Limits of these figures.** They illustrate failure modes; they do not measure how frequent each one is (the tables of
+sections 6.2 and 6.4 do), and they should be read with the following in mind.
+
+- *Selection.* The cases are the worst volumes by prostate Dice on the test split, from seed 0 of each model only, so they
+  are not representative by construction, and the worst lists of the three models differ (only `t014_week2` is on all
+  three). The typical case is one volume chosen near the median.
+- *Seeds.* Seed 0 of the plain 3D U-Net is its weakest run on the test split (prostate Dice 0.8465 against a mean of
+  0.8553 over the three seeds), seed 0 of the Improved U-Net is above its mean (0.8642 against 0.8568) and seed 0 of the
+  2D model is typical (0.8470 against 0.8459). The comparison of the three models on one volume (cases 1 and 2) therefore
+  partly reflects the luck of the seed.
+- *What is shown of a volume.* Four planes: three axial slices placed 15% inside the true extent of the prostate (base,
+  middle, apex) and one sagittal plane through the centre of the true prostate, in a window of 80 x 80 voxels (about
+  135 mm) around that centre. Never shown are the first and last slices of the prostate, where most of the Dice of
+  the base and apex is lost, the slices beyond the true extent (so reach beyond the base or apex and stray fragments
+  show only in the sagittal plane), planes off the midline, and the coronal plane. The axial panels are slices where
+  the true prostate exists, so a false prostate outside that range cannot appear in them.
+- *Which classes.* The difference panel scores the prostate only. The bladder and the rectum are drawn in the ground-truth
+  and prediction panels but their errors (the rectum Dice is 0.86) are not marked, and body and bone are not drawn.
+- *How it is drawn.* The overlays are 60% opaque and hide the image under them, which makes it hard to judge a contour
+  against the edge it follows. The images are the normalised intensities (z-scored and clipped at the 99.5th percentile)
+  in a fixed window, so the very bright focus of patient T014 is a processed intensity; the raw intensity and the clipping
+  are not visible. The data is downsampled (1.4-1.9 mm in the slice, 1.56 mm between slices) and a panel is only about 250
+  pixels wide, so thin structures such as the two lines at the apex in case 1 are small. One colour means different things
+  in different columns (see the legend), and red against green for false and correct prostate is hard to read with
+  red-green colour blindness.
+- *Ground truth and causes.* The contour is one annotator's, so "missed" and "false prostate" mean disagreement with that
+  contour, and in the rim cases (3 and 4) this cannot be told apart from annotation variability. The triggers are readings
+  of the images and were not tested.
+
 **Case 1: the apex tip is missed, by all three models (`t014_week2`).** Prostate Dice 0.765 (2D), 0.766 (3D U-Net), 0.787
 (Improved), with an apex-third Dice of only 0.53, 0.56 and 0.56 while the middle and base thirds reach 0.89-0.92. On the
 apex slice (third row) the true prostate is a small blob; the 2D model draws nothing there, the 3D U-Net a few voxels, the
@@ -550,8 +589,10 @@ surroundings, so a missed slice or a shift of one voxel costs a large share of i
 
 **Case 2: the prediction runs into the bladder at the base (same volume, sagittal plane).** The predicted prostate extends
 upward into the true bladder (yellow in the sagittal difference panel): 15.2% of the predicted prostate lies in the
-bladder with the 2D model, 8.7% with the 3D U-Net and 5.7% with the Improved U-Net, the same order as the averages in
-section 6.4. *Trigger:* the interface between the bladder and the prostate base is a one or two voxel boundary between a
+bladder with the 2D model, 8.7% with the 3D U-Net and 5.7% with the Improved U-Net. On average over the test volumes
+(section 6.4) the 2D model also leaks most (2.5% against about 1.0% for both 3D models), but the order of the two 3D
+models differs from this volume (1.0% for the 3D U-Net, 1.1% for the Improved U-Net), so only the gap between the 2D and
+the 3D models is a pattern, not the order of the two 3D models. *Trigger:* the interface between the bladder and the prostate base is a one or two voxel boundary between a
 very bright and a dark region; the 2D model decides every slice on its own and passes it more often. This is
 the over-contouring failure that the open question warns about, and the 3D models reduce it.
 
@@ -620,7 +661,8 @@ patients and three seeds per model:
   and not a controlled ablation of one factor.
 - The in-plane spacing (1.41-1.88 mm) was not corrected, and no distance-based measure (Hausdorff distance, surface
   distance) is reported.
-- The causes named in section 6.5 were read from the figures and not tested.
+- The causes named in section 6.5 were read from the figures and not tested, and the figures themselves are a small,
+  selected sample with several display limits (listed in section 6.5).
 
 ## 7. Artificial Intelligence Usage Disclosure
 
