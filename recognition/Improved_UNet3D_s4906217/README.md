@@ -3,8 +3,8 @@
 COMP3710 Report 2026, Segmentation project 2.2 (Hard difficulty). Student: s4906217.
 
 > **Draft status.** All experiments are finished and the held-out test split was evaluated once, after the protocol
-> of section 5 was frozen. The remaining `TODO(...)` markers are for the student's own input (dependency versions
-> and the AI disclosure). No `TODO` may remain at submission.
+> of section 5 was frozen. The remaining `TODO(student)` markers are for the student's own words in the AI disclosure
+> (section 7). No `TODO` may remain at submission.
 
 ## Contents
 
@@ -115,11 +115,11 @@ against the 2D baseline. (Outcome: the fallback was not needed.)
 
 | Package | Version used for the experiments (Rangpur, conda environment `torch`) |
 |---|---|
-| Python | 3.11 |
+| Python | 3.11.16 |
 | PyTorch | 2.13.0+cu130 (CUDA 13.0, cuDNN 9.20) |
 | NumPy | 2.4.6 |
-| nibabel | **TODO(versions)** |
-| matplotlib | **TODO(versions)** |
+| nibabel | 5.4.2 |
+| matplotlib | 3.11.1 |
 | SciPy | 1.17.1 (optional: connected components in `predict.py`) |
 
 The unit tests were run locally on the CPU (Python 3.13.2, PyTorch 2.8.0, NumPy 2.3.3, matplotlib 3.10.7, SciPy
