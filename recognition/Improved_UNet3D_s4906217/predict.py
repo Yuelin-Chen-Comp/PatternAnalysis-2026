@@ -204,8 +204,11 @@ def predict_volume(model, dim: int, volume: dataset.Volume, device, amp_dtype) -
 # figures (matplotlib is optional)
 # ---------------------------------------------------------------------------
 
-COLOURS = {"bladder": (0.2, 0.4, 1.0), "rectum": (0.1, 0.8, 0.3), "prostate": (1.0, 0.15, 0.15),
-           "tp": (0.1, 0.8, 0.2), "fp": (1.0, 0.15, 0.15), "fn": (0.2, 0.4, 1.0), "leak": (1.0, 0.85, 0.0)}
+# Okabe-Ito colours, chosen to stay distinguishable with the common kinds of colour blindness. The organs have their own
+# colours; the colours of the prostate difference (correct / missed / false / false inside an organ at risk) are different.
+COLOURS = {"bladder": "#56B4E9", "rectum": "#E69F00", "prostate": "#CC79A7",
+           "tp": "#009E73", "fn": "#0072B2", "fp": "#D55E00", "leak": "#F0E442"}
+HALF_WINDOW = 40   # the figures show 80 x 80 voxels (about 135 mm) around the centre of the true prostate
 
 
 def _pyplot():
@@ -226,56 +229,90 @@ def _window(centre: int, half: int, size: int) -> slice:
 
 def _tint(shape, masks) -> np.ndarray:
     """RGBA image with each (mask, colour) painted in turn; transparent elsewhere."""
+    from matplotlib.colors import to_rgb
     rgba = np.zeros(shape + (4,))
     for mask, colour in masks:
-        rgba[mask] = (*colour, 0.6)
+        rgba[mask] = (*to_rgb(colour), 0.65)
     return rgba
 
 
+def case_planes(label: np.ndarray) -> Dict:
+    """Where to cut a volume for a case figure: three axial slices (the two ends of the true prostate and its middle)
+    and the sagittal and coronal planes through its centre.
+
+    An end is one slice inside the first or last slice that holds prostate, because the very first slice is often a
+    single voxel; a prostate of fewer than three slices uses its first and last slice. If the label has no prostate the
+    middle of the volume is used."""
+    X, Y, Z = label.shape
+    gt = label == PROSTATE
+    extent = prostate_extent(gt)
+    if extent is None:
+        return {"axial": [("middle", Z // 2)], "centre": (X // 2, Y // 2, Z // 2), "extent": None}
+    lo, hi = extent
+    inset = 1 if hi - lo >= 2 else 0
+    centre = tuple(int(v) for v in np.argwhere(gt).mean(axis=0).round())
+    return {"axial": [("base end", hi - inset), ("middle", (lo + hi) // 2), ("apex end", lo + inset)],
+            "centre": centre, "extent": extent}
+
+
+def _cut(volume3d: np.ndarray, kind: str, index: int, windows) -> Tuple[np.ndarray, str]:
+    """One 2D plane of a volume, oriented for display, and the origin to draw it with.
+    axial: X across, Y down (anterior at the top); sagittal: Y across (anterior left), Z up (superior at the top);
+    coronal: X across (the patient's left on the right), Z up."""
+    wx, wy, wz = windows
+    if kind == "axial":
+        return volume3d[wx, wy, index].T, "upper"
+    if kind == "sagittal":
+        return volume3d[index, wy, wz].T, "lower"
+    return volume3d[wx, index, wz].T, "lower"
+
+
+def case_rows(label: np.ndarray) -> List[Tuple[str, str, int]]:
+    """(row label, plane kind, index) for the rows of a case figure."""
+    planes = case_planes(label)
+    cx, cy, _ = planes["centre"]
+    rows = [(f"axial, {name} (z={z})", "axial", z) for name, z in planes["axial"]]
+    return rows + [(f"sagittal (x={cx})", "sagittal", cx), (f"coronal (y={cy})", "coronal", cy)]
+
+
 def case_panels(img: np.ndarray, gt: np.ndarray, pr: np.ndarray):
-    """(input, ground-truth overlay, prediction overlay, difference overlay) of one 2D plane."""
+    """(input, ground truth, prediction, prostate difference, bladder and rectum errors) of one 2D plane."""
     organs = lambda lab: [(lab == BLADDER, COLOURS["bladder"]), (lab == RECTUM, COLOURS["rectum"]),  # noqa: E731
                           (lab == PROSTATE, COLOURS["prostate"])]
     g, p = gt == PROSTATE, pr == PROSTATE
     in_oar = (gt == RECTUM) | (gt == BLADDER)
     diff = [(g & p, COLOURS["tp"]), (g & ~p, COLOURS["fn"]), (p & ~g, COLOURS["fp"]), (p & ~g & in_oar, COLOURS["leak"])]
-    return img, _tint(gt.shape, organs(gt)), _tint(gt.shape, organs(pr)), _tint(gt.shape, diff)
+    other = [((gt == BLADDER) != (pr == BLADDER), COLOURS["bladder"]), ((gt == RECTUM) != (pr == RECTUM), COLOURS["rectum"])]
+    shape = gt.shape
+    return img, _tint(shape, organs(gt)), _tint(shape, organs(pr)), _tint(shape, diff), _tint(shape, other)
+
+
+def _prepare(volume: dataset.Volume, pred: np.ndarray):
+    image, label = np.asarray(volume.image, dtype=np.float32), volume.label
+    cx, cy, cz = case_planes(label)["centre"]
+    X, Y, Z = label.shape
+    windows = (_window(cx, HALF_WINDOW, X), _window(cy, HALF_WINDOW, Y), _window(cz, HALF_WINDOW, Z))
+    return image, label, windows, (float(image.min()), float(np.percentile(image, 99.5)))
 
 
 def plot_case(path: Path, volume: dataset.Volume, pred: np.ndarray, title: str) -> bool:
-    """Axial base / middle / apex slices and a sagittal plane through the prostate: four columns
-    (input, ground truth, prediction, difference). Blue = bladder, green = rectum, red = prostate; in the
-    difference column green = correct prostate, blue = missed (FN), red = false prostate (FP), yellow = FP that
-    lies inside the true rectum or bladder."""
+    """Overview of one volume: the axial slices at the base end, in the middle and at the apex end of the true prostate,
+    a sagittal and a coronal plane through its centre. Columns: the MRI, the ground truth, the prediction, the difference
+    for the prostate (correct / missed / false / false inside the true rectum or bladder) and the errors of the bladder
+    and the rectum (missed or extra voxels, in the colour of the organ)."""
     plt = _pyplot()
     if plt is None:
         return False
-    image, label = np.asarray(volume.image, dtype=np.float32), volume.label
-    gt = label == PROSTATE
-    extent = prostate_extent(gt)
-    X, Y, Z = label.shape
-    if extent:
-        centre = np.argwhere(gt).mean(axis=0).round().astype(int)
-        n = extent[1] - extent[0]
-        shift = int(round(0.15 * n))
-        planes = [("base", extent[1] - shift), ("middle", (extent[0] + extent[1]) // 2), ("apex", extent[0] + shift)]
-    else:
-        centre, planes = np.array([X // 2, Y // 2, Z // 2]), [("middle", Z // 2)]
-    vmin, vmax = float(image.min()), float(np.percentile(image, 99.5))
-    wx, wy, wz = _window(centre[0], 40, X), _window(centre[1], 40, Y), _window(centre[2], 40, Z)
-
-    rows = []
-    for name, z in planes:   # axial: X across, Y down (anterior at the top)
-        rows.append((f"axial, {name} (z={z})", "upper",
-                     *case_panels(image[wx, wy, z].T, label[wx, wy, z].T, pred[wx, wy, z].T)))
-    sx = int(centre[0])      # sagittal: Y across (anterior left), Z up (superior at the top)
-    rows.append((f"sagittal (x={sx})", "lower",
-                 *case_panels(image[sx, wy, wz].T, label[sx, wy, wz].T, pred[sx, wy, wz].T)))
-
-    fig, axes = plt.subplots(len(rows), 4, figsize=(10.5, 2.7 * len(rows)))
+    image, label, windows, (vmin, vmax) = _prepare(volume, pred)
+    rows = case_rows(label)
+    heads = ("input", "ground truth", "prediction", "prostate difference", "bladder and rectum errors")
+    fig, axes = plt.subplots(len(rows), 5, figsize=(13.2, 2.7 * len(rows)))
     axes = np.atleast_2d(axes)
-    for r, (name, origin, img, gt_overlay, pr_overlay, diff_overlay) in enumerate(rows):
-        for c, panel in enumerate((img, gt_overlay, pr_overlay, diff_overlay)):
+    for r, (name, kind, index) in enumerate(rows):
+        img, origin = _cut(image, kind, index, windows)
+        gt, _ = _cut(label, kind, index, windows)
+        pr, _ = _cut(pred, kind, index, windows)
+        for c, panel in enumerate(case_panels(img, gt, pr)):
             ax = axes[r, c]
             ax.imshow(img, cmap="gray", vmin=vmin, vmax=vmax, origin=origin)
             if c:
@@ -283,21 +320,83 @@ def plot_case(path: Path, volume: dataset.Volume, pred: np.ndarray, title: str) 
             ax.set_xticks([])
             ax.set_yticks([])
             if r == 0:
-                ax.set_title(("input", "ground truth", "prediction", "difference")[c], fontsize=10)
+                ax.set_title(heads[c], fontsize=10)
             if c == 0:
                 ax.set_ylabel(name, fontsize=8)
     from matplotlib.patches import Patch   # the colours mean different things in the columns, so say so
-    swatch = lambda name: Patch(facecolor=COLOURS[name], alpha=0.85)  # noqa: E731
+    swatch = lambda name: Patch(facecolor=COLOURS[name], alpha=0.9)  # noqa: E731
     fig.legend([swatch("bladder"), swatch("rectum"), swatch("prostate")], ["bladder", "rectum", "prostate"],
-               loc="lower center", bbox_to_anchor=(0.40, 0.0), ncol=3, fontsize=8, title_fontsize=8,
+               loc="lower center", bbox_to_anchor=(0.24, 0.0), ncol=3, fontsize=8, title_fontsize=8,
                title="ground truth and prediction", frameon=False)
     fig.legend([swatch("tp"), swatch("fn"), swatch("fp"), swatch("leak")],
                ["correct prostate", "missed prostate (FN)", "false prostate (FP)", "FP inside true rectum/bladder"],
-               loc="lower center", bbox_to_anchor=(0.80, 0.0), ncol=2, fontsize=8, title_fontsize=8,
-               title="difference", frameon=False)
+               loc="lower center", bbox_to_anchor=(0.62, 0.0), ncol=2, fontsize=8, title_fontsize=8,
+               title="prostate difference", frameon=False)
+    fig.legend([swatch("bladder"), swatch("rectum")], ["bladder: missed or extra", "rectum: missed or extra"],
+               loc="lower center", bbox_to_anchor=(0.91, 0.0), ncol=1, fontsize=8, title_fontsize=8,
+               title="bladder and rectum errors", frameon=False)
     fig.suptitle(title, fontsize=9)
-    fig.tight_layout(rect=(0, 0.07, 1, 0.97))
-    fig.savefig(path, dpi=120)
+    fig.tight_layout(rect=(0, 0.06, 1, 0.97))
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+    return True
+
+
+def _draw_contour(ax, mask: np.ndarray, colour: str, linestyle: str) -> None:
+    """The outline of a mask as a line with a black edge (so that it shows on any grey; the edge follows the dashes of
+    a dashed line), nothing for an empty or a full mask."""
+    if mask.any() and not mask.all():
+        from matplotlib import patheffects
+        edge = [patheffects.withStroke(linewidth=3.8, foreground="black")]
+        lines = ax.contour(mask.astype(float), levels=[0.5], colors=[colour], linewidths=1.8, linestyles=[linestyle])
+        if hasattr(lines, "set_path_effects"):          # matplotlib >= 3.8: the contour set is one collection
+            lines.set_path_effects(edge)
+        else:
+            for collection in lines.collections:
+                collection.set_path_effects(edge)
+
+
+def plot_contours(path: Path, volume: dataset.Volume, pred: np.ndarray, title: str) -> bool:
+    """The same planes as plot_case, but with outlines instead of filled colours, so that the image under the contour
+    stays visible: the plain MRI, the prostate (ground truth solid, prediction dashed), and the bladder and rectum."""
+    plt = _pyplot()
+    if plt is None:
+        return False
+    image, label, windows, (vmin, vmax) = _prepare(volume, pred)
+    rows = case_rows(label)
+    heads = ("input", "prostate: ground truth (solid), prediction (dashed)", "bladder and rectum: same lines")
+    fig, axes = plt.subplots(len(rows), 3, figsize=(10.8, 3.5 * len(rows)))
+    axes = np.atleast_2d(axes)
+    for r, (name, kind, index) in enumerate(rows):
+        img, origin = _cut(image, kind, index, windows)
+        gt, _ = _cut(label, kind, index, windows)
+        pr, _ = _cut(pred, kind, index, windows)
+        for c in range(3):
+            ax = axes[r, c]
+            ax.imshow(img, cmap="gray", vmin=vmin, vmax=vmax, origin=origin)
+            if c == 1:
+                _draw_contour(ax, gt == PROSTATE, COLOURS["prostate"], "solid")
+                _draw_contour(ax, pr == PROSTATE, COLOURS["prostate"], "dashed")
+            elif c == 2:
+                for organ in (BLADDER, RECTUM):
+                    name_ = "bladder" if organ == BLADDER else "rectum"
+                    _draw_contour(ax, gt == organ, COLOURS[name_], "solid")
+                    _draw_contour(ax, pr == organ, COLOURS[name_], "dashed")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if r == 0:
+                ax.set_title(heads[c], fontsize=9)
+            if c == 0:
+                ax.set_ylabel(name, fontsize=8)
+    from matplotlib.lines import Line2D
+    handles = [Line2D([0], [0], color="black", lw=2, ls="solid"), Line2D([0], [0], color="black", lw=2, ls="dashed"),
+               Line2D([0], [0], color=COLOURS["prostate"], lw=3), Line2D([0], [0], color=COLOURS["bladder"], lw=3),
+               Line2D([0], [0], color=COLOURS["rectum"], lw=3)]
+    fig.legend(handles, ["solid: ground truth", "dashed: prediction", "prostate", "bladder", "rectum"],
+               loc="lower center", ncol=5, fontsize=9, frameon=False)
+    fig.suptitle(title, fontsize=9)
+    fig.tight_layout(rect=(0, 0.03, 1, 0.97))
+    fig.savefig(path, dpi=100)
     plt.close(fig)
     return True
 
@@ -357,6 +456,9 @@ def parse_args(argv=None):
     ap.add_argument("--max-cases", type=int, default=None, help="use only the first N volumes (smoke tests)")
     ap.add_argument("--worst", type=int, default=4, help="draw the N volumes with the lowest prostate Dice")
     ap.add_argument("--median", type=int, default=1, help="and N typical volumes (closest to the median Dice)")
+    ap.add_argument("--volumes", default=None,
+                    help="comma-separated volume names to draw (e.g. t014_week2,j026_week6) instead of the worst and "
+                         "typical ones; use the same names for every model to compare them on the same volumes")
     ap.add_argument("--no-figures", action="store_true")
     ap.add_argument("--amp", choices=("bf16", "fp16", "none"), default=None, help="default bf16 on a GPU, none on a CPU")
     return ap.parse_args(argv)
@@ -443,7 +545,15 @@ def main(argv=None) -> Dict:
           + (f", peak GPU memory {summary['peak_inference_gib']:.2f} GiB" if device.type == "cuda" else ""))
 
     figures = []
-    cases = select_cases(rows, args.worst, args.median)
+    if args.volumes:
+        wanted = [v.strip() for v in args.volumes.split(",") if v.strip()]
+        known = {r["name"]: r for r in rows}
+        unknown = [v for v in wanted if v not in known]
+        if unknown:
+            raise SystemExit(f"unknown volume(s) {unknown}; the {args.split} split has: {', '.join(sorted(known))}")
+        cases = [("selected", known[v]) for v in wanted]
+    else:
+        cases = select_cases(rows, args.worst, args.median)
     if not args.no_figures:
         if plot_summary(out_dir / "summary.png", rows):
             figures.append("summary.png")
@@ -451,12 +561,16 @@ def main(argv=None) -> Dict:
             vol, pred = by_name[row["name"]]
             title = (f"{ckpt['args']['model']}, {args.split}: {row['name']} ({kind} case), prostate Dice "
                      f"{row['dice'][PROSTATE]:.3f} (apex {row['dice_apex']:.2f}, mid {row['dice_mid']:.2f}, "
-                     f"base {row['dice_base']:.2f})\n"
+                     f"base {row['dice_base']:.2f}); bladder Dice {row['dice'][BLADDER]:.2f}, rectum Dice "
+                     f"{row['dice'][RECTUM]:.2f}\n"
                      f"predicted prostate inside true rectum {100 * row['leak_rectum']:.1f}%, bladder "
                      f"{100 * row['leak_bladder']:.1f}%; true prostate called bladder {100 * row['miss_to_bladder']:.1f}% "
                      f"(base third {100 * row['miss_to_bladder_base']:.1f}%), rectum {100 * row['miss_to_rectum']:.1f}%")
             fname = f"{kind}_{row['name']}.png"
             if plot_case(out_dir / fname, vol, pred, title):
+                figures.append(fname)
+            fname = f"{kind}_{row['name']}_contours.png"
+            if plot_contours(out_dir / fname, vol, pred, title):
                 figures.append(fname)
     print("\nCases for the error analysis: " + ", ".join(f"{k} {r['name']} ({r['dice'][PROSTATE]:.3f})" for k, r in cases))
 

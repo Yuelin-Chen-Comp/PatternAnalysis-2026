@@ -225,6 +225,91 @@ def test_patient_level_averages_over_patients_not_volumes():
     assert abs(over_nan["x"][0] - 0.2) < 1e-9, "a patient without a defined value is skipped"
 
 
+def test_case_planes_use_the_two_ends_and_the_middle_of_the_true_prostate():
+    need(torch is not None)
+    label = labels_from(prostate=block(z=(10, 22)))                    # prostate on z 10..21
+    planes = predict.case_planes(label)
+    assert planes["axial"] == [("base end", 20), ("middle", 15), ("apex end", 11)], "one slice inside each end"
+    assert planes["extent"] == (10, 21)
+    assert planes["centre"] == (10, 10, 16), "the centre of the true prostate (x 6..13, y 6..13, z 10..21), rounded"
+    short = predict.case_planes(labels_from(prostate=block(z=(10, 12))))   # only two slices: use the slices themselves
+    assert [z for _, z in short["axial"]] == [11, 10, 10], "no inset for a prostate of two slices"
+    none = predict.case_planes(labels_from())                           # no prostate in the label: the middle of the volume
+    assert none["axial"] == [("middle", 15)] and none["extent"] is None
+
+
+def test_case_rows_and_cuts_have_the_right_orientation():
+    need(torch is not None)
+    shape = (20, 24, 30)
+    vol = np.arange(np.prod(shape)).reshape(shape)
+    windows = (slice(0, 20), slice(0, 24), slice(0, 30))
+    axial, origin_a = predict._cut(vol, "axial", 5, windows)
+    sagittal, origin_s = predict._cut(vol, "sagittal", 7, windows)
+    coronal, origin_c = predict._cut(vol, "coronal", 9, windows)
+    assert axial.shape == (24, 20) and origin_a == "upper"            # rows Y (anterior at the top), columns X
+    assert sagittal.shape == (30, 24) and origin_s == "lower"         # rows Z (superior at the top), columns Y
+    assert coronal.shape == (30, 20) and origin_c == "lower"          # rows Z, columns X
+    assert axial[3, 2] == vol[2, 3, 5] and sagittal[4, 3] == vol[7, 3, 4] and coronal[4, 2] == vol[2, 9, 4]
+    rows = predict.case_rows(labels_from(prostate=block(z=(10, 22))))
+    assert [kind for _, kind, _ in rows] == ["axial", "axial", "axial", "sagittal", "coronal"]
+
+
+def test_panels_mark_the_errors_of_the_bladder_and_the_rectum_too():
+    need(torch is not None and predict._pyplot() is not None, "matplotlib not installed")
+    from matplotlib.colors import to_rgb
+    gt = np.zeros((6, 6), np.uint8)
+    gt[1:3, 1:3], gt[3:5, 1:3], gt[1:3, 4:6] = BLADDER, RECTUM, PROSTATE
+    pr = gt.copy()
+    pr[1, 1] = 0                                                       # a bladder voxel missed
+    pr[3, 1] = 0                                                       # a rectum voxel missed (only the rectum is wrong here)
+    pr[4, 2] = BLADDER                                                 # a rectum voxel called bladder (both organs are wrong)
+    *_, other = predict.case_panels(np.zeros((6, 6)), gt, pr)
+    assert tuple(other[1, 1, :3]) == to_rgb(predict.COLOURS["bladder"]) and other[1, 1, 3] > 0
+    assert tuple(other[3, 1, :3]) == to_rgb(predict.COLOURS["rectum"]) and other[3, 1, 3] > 0, "a rectum-only error is marked"
+    assert other[4, 2, 3] > 0, "a voxel that changed from rectum to bladder is marked"
+    assert other[2, 2, 3] == 0 and other[1, 4, 3] == 0, "correct voxels and the prostate are not marked"
+    assert len({predict.COLOURS[k] for k in ("bladder", "rectum", "prostate", "tp", "fn", "fp", "leak")}) == 7
+
+
+def test_contour_figure_is_written_even_without_prostate_or_prediction():
+    need(torch is not None and predict._pyplot() is not None, "matplotlib not installed")
+    with tempfile.TemporaryDirectory() as tmp:
+        shape = (24, 24, 20)
+        rng = np.random.default_rng(0)
+        label = labels_from(prostate=block(shape=shape, z=(6, 14), xy=(8, 14)), shape=shape)
+        vol = dataset.Volume("v", "P", rng.normal(size=shape).astype(np.float16), label, (1.7, 1.7, 1.5))
+        for pred in (label.copy(), np.zeros_like(label)):               # a perfect prediction and an empty one
+            path = Path(tmp) / "c.png"
+            assert predict.plot_contours(path, vol, pred, "t") and path.stat().st_size > 1000
+            assert predict.plot_case(Path(tmp) / "o.png", vol, pred, "t") and (Path(tmp) / "o.png").stat().st_size > 1000
+        empty = dataset.Volume("e", "P", vol.image, np.zeros_like(label), vol.spacing)   # no prostate in the label at all
+        assert predict.plot_contours(Path(tmp) / "e.png", empty, np.zeros_like(label), "t")
+
+
+def test_volumes_option_draws_exactly_the_named_volumes():
+    need(torch is not None)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        make_fake_study(tmp / "study", tmp / "cache")
+        common = ["--root", str(tmp / "study"), "--cache-dir", str(tmp / "cache"),
+                  "--split-file", str(tmp / "split.json"), "--out-dir", str(tmp / "runs")]
+        train.main(["--model", "unet3d", "--name", "t", "--epochs", "1", "--val-every", "1", "--samples-per-epoch", "4",
+                    "--batch-size", "2", "--patch", "16", "16", "8", "--base-channels", "4", "--depth", "2",
+                    "--workers", "0", *common])
+        names = [v["name"] for v in predict.main(["--name", "t", "--split", "test", "--no-figures", *common])["volumes"]]
+        chosen = names[1]
+        result = predict.main(["--name", "t", "--split", "test", "--volumes", chosen, *common])
+        figs = [f for f in result["figures"] if f != "summary.png"]
+        assert sorted(figs) == sorted([f"selected_{chosen}.png", f"selected_{chosen}_contours.png"]), figs
+        assert [c["name"] for c in result["cases"]] == [chosen] and result["cases"][0]["kind"] == "selected"
+        try:
+            predict.main(["--name", "t", "--split", "test", "--volumes", "no_such_volume", *common])
+        except SystemExit as exit_:
+            assert "no_such_volume" in str(exit_) and chosen in str(exit_), "the error lists the volumes that exist"
+        else:
+            raise AssertionError("an unknown volume name must stop with a message")
+
+
 # ---------------------------------------------------------------------------
 # the whole pipeline on a fake study
 # ---------------------------------------------------------------------------
@@ -260,7 +345,9 @@ def test_predict_runs_end_to_end_for_all_models():
                 have_plots = False
             if have_plots:
                 assert (out / "summary.png").exists()
-                assert len([f for f in saved["figures"] if f != "summary.png"]) == 2   # both volumes: 2 worst, none left over
+                case_figs = [f for f in saved["figures"] if f != "summary.png"]
+                assert len(case_figs) == 4, case_figs    # both volumes (2 worst, none left over): overview + contours each
+                assert sum(f.endswith("_contours.png") for f in case_figs) == 2
                 for f in saved["figures"]:
                     assert (out / f).stat().st_size > 1000
 
