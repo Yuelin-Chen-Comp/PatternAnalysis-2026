@@ -39,11 +39,13 @@ from the loss (their half- and quarter-resolution scores also get a loss of thei
 whole volumes at test time. It is compared against a 2D U-Net baseline (run slice by slice and restacked into 3D) and
 a plain 3D U-Net, on identical held-out patients.
 
-**Figure.** A typical test case of the Improved U-Net (`t014_week7`, prostate Dice 0.874): axial base, middle and apex
-slices and a sagittal plane; input, ground truth, prediction and difference (difference: green = correct prostate,
-blue = missed, red = false prostate, yellow = false prostate inside the true rectum or bladder).
+**Figure.** A test case of the Improved U-Net with a prostate Dice of 0.859, close to its mean of 0.857 on the test split
+(`v027_week1`): axial slices at the base end, in the middle and at the apex end of the prostate, a sagittal and a coronal plane;
+the MRI, the annotation, the prediction, the difference for the prostate (bluish green = correct, blue = missed, vermillion =
+false prostate, yellow = false prostate inside the true rectum or bladder) and the errors of the bladder and the rectum. Section
+6.5 explains how to read these figures.
 
-![A typical test case of the Improved U-Net](images/test_typical_improved3d_t014_week7.png)
+![A test case of the Improved U-Net](images/test_v027_week1_improved3d.jpg)
 
 **Headline result.** On the 6 held-out test patients all three models reach a prostate Dice of 0.85-0.86 (three seeds
 each): 2D U-Net 0.846 +- 0.002, 3D U-Net 0.855 +- 0.009, Improved 3D U-Net 0.857 +- 0.007. The 3D models are slightly
@@ -173,7 +175,8 @@ python summarise_runs.py --split test                                 # the tabl
 
 The job scripts ask for one hour; the runs above were submitted with `sbatch --time=02:00:00 ...` for the 3D models.
 
-`predict.py --split test` writes `results.json`, `summary.png` and figures of the worst and a typical case to
+`predict.py --split test` writes `results.json`, `summary.png` and, for the worst and a typical volume (or for the
+volumes named with `--volumes`), an overview figure and a contour figure to
 `~/hipmri_runs/<name>/predict_test/`. The default split of `predict.py` is `val`; the test split is used only with
 `--split test`.
 
@@ -254,6 +257,11 @@ The validation split has the same number of patients as the test split; with onl
 each, a single difficult patient moves a mean visibly (section 6), which is why results are also given per patient.
 The proportions follow the usual 70 / 15 / 15; k-fold cross-validation would give less noisy estimates but was not
 affordable in the available time.
+
+The test patients are unbalanced: J026, T014 and V027 have 8 volumes each, and K008, S028 and T009 have one volume
+each (27 in total; the 6 validation patients have 8 each). Averages over volumes are therefore dominated by the three
+patients with 8 volumes (24 of 27), and for the other three "patients" a patient-level value rests on a single scan.
+Both ways of averaging are reported.
 
 ### 4.5 Patch and slice sampling, augmentation
 
@@ -411,7 +419,8 @@ Reading the tables:
   for the 3D models, 0.75 for the 2D baseline), and per-class Dice and IoU are reported for all labels.
 - **The three models are close.** The prostate Dice differs by at most 0.011 over volumes (0.006 over patients), which is
   smaller than the range of the per-patient differences (about 0.03). The 3D models are better in 5 of 6
-  patients (a sign test gives p = 0.22) and S028 is better with the 2D model.
+  patients (a sign test gives p = 0.22; three of the six patients have a single volume) and S028, which has a single
+  volume, is better with the 2D model.
 - The hardest patient is T014 (0.80-0.81 with every model); the easiest are V027, T009 and S028 (0.87-0.90).
 - **The Improved U-Net is no better than the plain 3D U-Net** (+0.0015 over volumes, -0.001 over patients, better in 2 of
   6 patients), although it is 1.3 times as expensive (section 6.3).
@@ -523,99 +532,141 @@ What the measures say about the open question:
 
 ### 6.5 Failure cases
 
-Four failure cases are examined: three are among the worst volumes by prostate Dice (seed 0 of each model), the fourth
-is a typical volume whose base is poor although its overall Dice is good. In every figure
-the rows are the axial base, middle and apex slices and a sagittal plane, the columns are input, ground truth,
-prediction and difference (green = correct prostate, blue = missed, red = false prostate, yellow = false prostate inside
-the true rectum or bladder). The triggers named below are the likely causes from the images; they were not tested.
+**Which volumes.** The weekly volumes of a patient are near-copies of each other, and the four hardest volumes overall were all
+scans of one patient (T014, weeks 4, 2, 5 and 3). The cases are therefore chosen per patient: for every test patient, the volume
+with the lowest prostate Dice averaged over all nine runs ([`scripts/summarise_runs.py`](scripts/summarise_runs.py)), and the
+four patients with the lowest values are examined: T014 (`t014_week4`, mean 0.769), J026 (`j026_week2`, 0.804), K008
+(`k008_week0`, 0.835, the only volume of that patient) and V027 (`v027_week1`, 0.851). Every volume is drawn for all three models,
+each with the run that has the median prostate Dice of its three seeds on the test split (2D U-Net seed 1, 3D U-Net seed 2,
+Improved U-Net seed 2), so that the models are compared on the same volumes and none is shown with its best or worst seed. The
+selection uses the test results, which is fine for illustrating failure modes but not for evaluating a model.
 
-**How to read a figure.** The annotated example below is the 2D U-Net on `t014_week2` (case 1 and 2). Each figure has four
-rows (three axial slices near the base, in the middle and near the apex of the prostate, and one sagittal side view)
-and four columns (the MRI slice, the annotated contour, the model's prediction, and their difference). The title gives
-the Dice of the prostate and of its three thirds, the share of the predicted prostate that lies in the true rectum
-and bladder, and the share of the true prostate that was called bladder or rectum. In the difference column mostly
-green is good, a blue rim all around means that the contour is too small, a red rim that it is too wide, a blue blob that
-part of the prostate was missed, and yellow that the prediction runs into the bladder or rectum.
+Prostate Dice of these volumes (apex / middle / base third in brackets):
 
-![How to read a case figure: rows, columns, colours and three examples](images/how_to_read_a_case_figure.png)
+| Volume (patient, volumes of the patient) | 2D U-Net (seed 1) | 3D U-Net (seed 2) | Improved 3D U-Net (seed 2) |
+|---|---|---|---|
+| `t014_week4` (T014, 8) | 0.809 (0.77 / 0.92 / 0.89) | 0.775 (0.75 / 0.90 / 0.83) | 0.736 (0.79 / 0.90 / 0.80) |
+| `j026_week2` (J026, 8) | 0.761 (0.78 / 0.85 / 0.69) | 0.851 (0.81 / 0.90 / 0.82) | 0.801 (0.78 / 0.87 / 0.76) |
+| `k008_week0` (K008, 1) | 0.827 (0.58 / 0.91 / 0.88) | 0.815 (0.59 / 0.89 / 0.87) | 0.839 (0.62 / 0.91 / 0.89) |
+| `v027_week1` (V027, 8) | 0.847 (0.87 / 0.91 / 0.71) | 0.858 (0.85 / 0.93 / 0.74) | 0.859 (0.89 / 0.93 / 0.73) |
+
+**How to read a figure.** Each figure has five rows and five columns, shown with the labels of the first one below. The rows are
+the axial slices at the base end, in the middle and at the apex end of the true prostate (seen from the feet, as in radiology: front at
+the top, the patient's left on the right),
+a sagittal side view (head at the top, front at the left) and a coronal front view (head at the top). The columns are the MRI,
+the annotated contour, the model's prediction, the difference for the prostate and the errors of the bladder and the rectum. The
+title gives the Dice of the prostate and of its three thirds, the Dice of the bladder and the rectum, the share of the predicted
+prostate that lies in the true rectum and bladder, and the share of the true prostate that was called bladder or rectum.
+
+![How to read a case figure: rows and columns, and three numbered examples](images/how_to_read_a_case_figure.jpg)
+
+- **Colours.** In the annotation and prediction columns sky blue is the bladder, orange the rectum and reddish purple the
+  prostate. In the *prostate difference* column the colours mean something else: bluish green = prostate that is correct,
+  blue = true prostate that the model missed, vermillion = prostate that the model drew where there is none, yellow = false
+  prostate that lies inside the true bladder or rectum. In the *bladder and rectum errors* column every voxel that is missed
+  or extra is drawn in the colour of its organ. The palette is chosen to stay distinguishable with common kinds of colour
+  blindness.
+- **1** the prediction is smaller than the annotation at the apex end: the blue ring is true prostate that was not drawn.
+- **2** the prediction is too big at the base end: the vermillion crescent is false prostate (here at the front edge).
+- **3** errors of the rectum (and, at the top of the column, of the bladder) are thin rims of one voxel: the contour is about
+  1.5 mm off, which is the common and small kind of error.
+- Mostly bluish green in the difference column is good; a ring of blue all around means that the contour is too small, a ring
+  of vermillion that it is too wide; yellow is the dangerous kind (the prediction runs into an organ at risk).
+- A second figure per case, the *contour figure*, draws outlines instead of filled colours (ground truth solid, prediction
+  dashed) so that the image under the contour stays visible; one is shown with case 1.
 
 **Limits of these figures.** They illustrate failure modes; they do not measure how frequent each one is (the tables of
-sections 6.2 and 6.4 do), and they should be read with the following in mind.
+sections 6.2 and 6.4 do).
 
-- *Selection.* The cases are the worst volumes by prostate Dice on the test split, from seed 0 of each model only, so they
-  are not representative by construction, and the worst lists of the three models differ (only `t014_week2` is on all
-  three). The typical case is one volume chosen near the median.
-- *Seeds.* Seed 0 of the plain 3D U-Net is its weakest run on the test split (prostate Dice 0.8465 against a mean of
-  0.8553 over the three seeds), seed 0 of the Improved U-Net is above its mean (0.8642 against 0.8568) and seed 0 of the
-  2D model is typical (0.8470 against 0.8459). The comparison of the three models on one volume (cases 1 and 2) therefore
-  partly reflects the luck of the seed.
-- *What is shown of a volume.* Four planes: three axial slices placed 15% inside the true extent of the prostate (base,
-  middle, apex) and one sagittal plane through the centre of the true prostate, in a window of 80 x 80 voxels (about
-  135 mm) around that centre. Never shown are the first and last slices of the prostate, where most of the Dice of
-  the base and apex is lost, the slices beyond the true extent (so reach beyond the base or apex and stray fragments
-  show only in the sagittal plane), planes off the midline, and the coronal plane. The axial panels are slices where
-  the true prostate exists, so a false prostate outside that range cannot appear in them.
-- *Which classes.* The difference panel scores the prostate only. The bladder and the rectum are drawn in the ground-truth
-  and prediction panels but their errors (the rectum Dice is 0.86) are not marked, and body and bone are not drawn.
-- *How it is drawn.* The overlays are 60% opaque and hide the image under them, which makes it hard to judge a contour
-  against the edge it follows. The images are the normalised intensities (z-scored and clipped at the 99.5th percentile)
-  in a fixed window, so the very bright focus of patient T014 is a processed intensity; the raw intensity and the clipping
-  are not visible. The data is downsampled (1.4-1.9 mm in the slice, 1.56 mm between slices) and a panel is only about 250
-  pixels wide, so thin structures such as the two lines at the apex in case 1 are small. One colour means different things
-  in different columns (see the legend), and red against green for false and correct prostate is hard to read with
-  red-green colour blindness.
-- *Ground truth and causes.* The contour is one annotator's, so "missed" and "false prostate" mean disagreement with that
-  contour, and in the rim cases (3 and 4) this cannot be told apart from annotation variability. The triggers are readings
-  of the images and were not tested.
+- *Selection.* The cases are the hardest volumes of the four hardest patients, so they are not typical by construction, and
+  they were chosen with the test results.
+- *Seeds.* A figure shows one run per model. The same volume gets different Dice from different seeds: `t014_week4` gets 0.771,
+  0.726 and 0.808 (2D, 3D, Improved) from the seed-0 runs but 0.809, 0.775 and 0.736 from the median-seed runs shown here. The
+  order of the models on a single volume therefore says little, and it differs between the volumes below.
+- *What is shown of a volume.* Five planes at fixed places: the slices one inside the first and the last slice of the true
+  prostate, the middle slice, and the sagittal and coronal planes through the centre of the true prostate, in a window of
+  80 x 80 voxels (about 135 mm). Never shown are the first and the last slice of the prostate, slices beyond its true extent (a
+  false prostate beyond the ends shows only in the sagittal and coronal planes) and planes off the centre.
+- *Which classes.* The prostate difference marks four kinds of error; for the bladder and the rectum only "missed or extra" is
+  shown, and body and bone are not drawn.
+- *How it is drawn.* The overlays are 65% opaque and hide the image under them (the contour figure does not). The images are
+  normalised intensities (z-scored and clipped at the 99.5th percentile) in a fixed window, so the very bright focus of patient
+  T014 is a processed intensity, and the data is downsampled (1.4-1.9 mm in the slice, 1.56 mm between slices). The figures are
+  JPEG-compressed to keep the repository small. One colour means different things in different columns (see the legends).
+- *Ground truth and causes.* The contour is one annotator's, so "missed" and "false prostate" mean disagreement with that contour,
+  and for the rim errors this cannot be told apart from annotation variability. The triggers named below are readings of the
+  images and were not tested.
 
-**Case 1: the apex tip is missed, by all three models (`t014_week2`).** Prostate Dice 0.765 (2D), 0.766 (3D U-Net), 0.787
-(Improved), with an apex-third Dice of only 0.53, 0.56 and 0.56 while the middle and base thirds reach 0.89-0.92. On the
-apex slice (third row) the true prostate is a small blob; the 2D model draws nothing there, the 3D U-Net a few voxels, the
-Improved U-Net two thin lines. *Trigger:* at the tip the prostate is a few voxels across with little contrast to its
-surroundings, so a missed slice or a shift of one voxel costs a large share of its Dice. 3D context helps a little
-(0.56 against 0.53) but does not solve it.
+**Case 1: `t014_week4` (T014): too big at the base end, too small at the apex end, with every model.** At the base end (first
+row) all three models draw a crescent of false prostate at the front edge of the gland, around a very bright spot of the input;
+the base-third Dice is 0.89 (2D), 0.83 (3D U-Net) and 0.80 (Improved), the predicted prostate is 1.20, 1.26 and 1.42 times the
+true volume, and the sagittal and coronal planes show the false prostate reaching up towards the bladder neck, with 1.8%, 1.4% and
+5.1% of the predicted prostate lying in the true bladder. At the apex end (third row) the prediction is smaller than the
+annotation (a blue ring); the apex Dice is 0.77, 0.75 and 0.79. The contour figure shows the same: the predicted contour (dashed)
+runs above the annotated one (solid) at the front edge. In this volume the 2D model has the highest Dice (0.809), the Improved
+U-Net the lowest (0.736). *Trigger (not tested):* the very bright focus, and the bright streak between the bladder and the prostate
+in the sagittal plane, seem to pull the contour outward; every T014 volume shown has them.
 
 *2D U-Net:*
 
-![t014_week2, 2D U-Net: the apex tip is missed and the prediction runs into the bladder](images/test_worst_t014_week2_unet2d.png)
+![t014_week4, 2D U-Net](images/test_t014_week4_unet2d.jpg)
 
 *3D U-Net:*
 
-![t014_week2, 3D U-Net](images/test_worst_t014_week2_unet3d.png)
+![t014_week4, 3D U-Net](images/test_t014_week4_unet3d.jpg)
 
 *Improved 3D U-Net:*
 
-![t014_week2, Improved 3D U-Net](images/test_worst_t014_week2_improved3d.png)
+![t014_week4, Improved 3D U-Net](images/test_t014_week4_improved3d.jpg)
 
-**Case 2: the prediction runs into the bladder at the base (same volume, sagittal plane).** The predicted prostate extends
-upward into the true bladder (yellow in the sagittal difference panel): 15.2% of the predicted prostate lies in the
-bladder with the 2D model, 8.7% with the 3D U-Net and 5.7% with the Improved U-Net. On average over the test volumes
-(section 6.4) the 2D model also leaks most (2.5% against about 1.0% for both 3D models), but the order of the two 3D
-models differs from this volume (1.0% for the 3D U-Net, 1.1% for the Improved U-Net), so only the gap between the 2D and
-the 3D models is a pattern, not the order of the two 3D models. *Trigger:* the interface between the bladder and the prostate base is a one or two voxel boundary between a
-very bright and a dark region; the 2D model decides every slice on its own and passes it more often. This is
-the over-contouring failure that the open question warns about, and the 3D models reduce it.
+*Contour figure of the 3D U-Net (ground truth solid, prediction dashed):*
 
-**Case 3: a contour that is too wide all around (`j026_week2`, Improved U-Net).** Prostate Dice 0.731 (base 0.77, middle
-0.90, apex 0.83) with no leakage into other organs ([figure](images/test_worst_j026_week2_improved3d.png)). The
-difference panels show a ring of false prostate (red) around the whole gland on the base, middle and apex slices: the
-prediction is a voxel or two wider than the annotation. *Trigger:* a systematic boundary offset between the model and
-this annotation; annotation variability cannot be separated from model error with a single annotator.
+![t014_week4, 3D U-Net, contours](images/test_t014_week4_unet3d_contours.jpg)
 
-![j026_week2, Improved 3D U-Net: a contour that is too wide all around](images/test_worst_j026_week2_improved3d.png)
+**Case 2: `j026_week2` (J026): a base end that is too wide all around.** At the base end the prediction is a ring wider than the
+annotation. It is widest with the 2D model (base-third Dice 0.69) and smaller with the 3D U-Net (0.82) and the Improved U-Net
+(0.76), so 3D context limits the over-reach here. At the apex end the prediction is smaller than the annotation: the 2D model draws
+only a speck, the 3D models a smaller blob (apex Dice 0.78, 0.81, 0.78). The rectum is worse than on average (Dice 0.80, 0.80,
+0.83). Nothing leaks into the bladder or the rectum. The Dice is 0.761, 0.851 and 0.801, so in this volume the 3D U-Net is the best
+and the 2D model the worst, the reverse of case 1. *Trigger (not tested):* a systematic offset between where these models and this
+annotator place the boundary, which is also visible in the middle slice as a thin rim.
 
-**Case 4: base slice at the bladder neck (`j026_week6`, 2D U-Net, a typical volume overall: Dice 0.858).** The base
-third has a Dice of only 0.71 and 6.0% of the predicted prostate lies in the true bladder
-([figure](images/test_typical_unet2d_j026_week6.png)). On the base slice the predicted bladder and prostate are both
-larger than the annotation and touch each other. *Trigger:* the same bladder-neck ambiguity as in case 2; it shows that
-a volume with a good overall Dice can still have a poor base.
+*2D U-Net:*
 
-![j026_week6, 2D U-Net: the base slice at the bladder neck](images/test_typical_unet2d_j026_week6.png)
+![j026_week2, 2D U-Net](images/test_j026_week2_unet2d.jpg)
 
-**A patient-level pattern.** Patient T014 is the hardest for every model (0.80-0.81 against 0.83-0.90 for the others), and
-the worst four volumes of the 2D and the 3D U-Net are all from T014. In the T014 volumes shown, the input has a very bright
-focus in the prostate on the base and middle slices, and a bright streak between the bladder and the prostate in the
-sagittal plane, which I did not see in the other patients looked at. Whether this causes the errors was not tested.
+*3D U-Net:*
+
+![j026_week2, 3D U-Net](images/test_j026_week2_unet3d.jpg)
+
+*Improved 3D U-Net:*
+
+![j026_week2, Improved 3D U-Net](images/test_j026_week2_improved3d.jpg)
+
+**Case 3: `k008_week0` (K008): the apex end is not drawn at all.** On the apex-end slice (third row) the annotation has a clear
+blob of prostate and the Improved U-Net's prediction has none (a solid blue patch in the difference column); the apex Dice is 0.62
+(0.58 with the 2D model, 0.59 with the 3D U-Net), while the middle and base thirds are good (0.91 and 0.89). The predicted prostate
+is 0.84-0.89 of the true volume, so this is under-contouring at the lower tip. The rectum has the lowest Dice of all the cases
+(0.76-0.81), with errors along its lower part in the sagittal plane. *Trigger (not tested):* the annotation reaches lower than
+what the models predict, in line with the 2D model's prediction stopping 1.2 mm short of the true apex on average (section 6.4).
+K008 has a single volume, so this is one scan, not a trend.
+
+![k008_week0, Improved 3D U-Net](images/test_k008_week0_improved3d.jpg)
+
+**Case 4: `v027_week1` (V027): a poor base with a good middle.** The base-third Dice is only 0.71-0.74 for every model while the
+middle third reaches 0.91-0.93 (prostate Dice 0.847, 0.858, 0.859). In the figure shown, of the Improved U-Net (the 3D U-Net looks
+the same), the prediction at the base end is a little too big on the back side (a vermillion crescent), in the middle slice the
+annotation extends further on one side than the prediction (a blue crescent), and the apex end has a thin blue ring. This volume is also the one case here where a base is read as bladder, and only by the 2D
+model: 4.4% of the true base-third prostate is called bladder, against 0.3% for both 3D models. It shows that a volume with a good
+overall Dice can still have a poor base.
+
+![v027_week1, Improved 3D U-Net](images/test_v027_week1_improved3d.jpg)
+
+**What the four cases have in common.** In the figures shown here, the apex end of the prediction is smaller than the annotation
+in all four patients, and the base end is too big in three of them (K008's base end is good). This matches the averages of section 6.4: the
+prediction reaches 2.0-2.6 mm too far at the base for every model, and the 2D model stops 1.2 mm short of the true apex. The
+models also differ from volume to volume and from seed to seed by more than their averages differ from each other, which is why
+the conclusions rest on the tables and not on these figures.
 
 ### 6.6 Recommendation to the project manager
 
@@ -640,15 +691,16 @@ patients and three seeds per model:
 2. **No model is fit for unattended use.** Every model is off by one or two voxels around the whole gland and loses part of
    the apex tip (the apex third keeps only 73-79% of the true voxels), and its prediction runs 2-3 mm past the true base.
    The apex tip and the bladder neck need mandatory review by the clinician, and volumes with a low Dice on the base or
-   apex (a few such volumes were found, for example `t014_week2` and `j026_week6`) are the cases that remain
+   apex (for example `t014_week4`, `j026_week2` and `k008_week0`, section 6.5) are the cases that remain
    unsuitable for automated drafting.
 3. **More patients are needed to choose between 2D and 3D**: with six test patients a difference below about 0.02 Dice cannot
    be established, and the ranking changed between the validation and the test split.
 
 ### 6.7 Limitations
 
-- Six test patients: differences smaller than the patient-to-patient spread (about 0.02-0.04 Dice) cannot be
-  established; seed noise (0.002-0.009) and patient variation are different things, and the seed standard deviation says
+- Six test patients, of which three have a single volume (J026, T014 and V027 have eight each): differences smaller
+  than the patient-to-patient spread (about 0.02-0.04 Dice) cannot be established, volume averages are dominated by the
+  three patients with eight volumes, and a patient-level value of the other three rests on one scan; seed noise (0.002-0.009) and patient variation are different things, and the seed standard deviation says
   nothing about how the models would do on new patients.
 - One split and no cross-validation; the test patients were not chosen for being representative, and the ranking of the
   models differed between the validation and the test split.
@@ -678,7 +730,7 @@ and protocol decisions, running every job on Rangpur, reading the results), and 
 
 **How the AI-written code was audited, verified and tested.**
 
-- 93 unit tests on synthetic data (data pipeline, models, loss and metrics, the training pipeline end to end, the boundary
+- 102 unit tests on synthetic data (data pipeline, models, loss and metrics, the training pipeline end to end, the boundary
   analysis, the result summary), including tests that predict.py and train.py give the same Dice for the same checkpoint.
 - *Deliberate-breakage checks:* for the models, the loss, the training script and the analysis, bugs were inserted on
   purpose (for example no padding, an ignored skip connection, swapped bladder and rectum, patient-level averaging
