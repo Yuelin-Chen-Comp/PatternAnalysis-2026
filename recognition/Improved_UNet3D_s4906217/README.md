@@ -2,10 +2,6 @@
 
 COMP3710 Report 2026, Segmentation project 2.2 (Hard difficulty). Student: s4906217.
 
-> **Draft status.** All experiments are finished and the held-out test split was evaluated once, after the protocol
-> of section 5 was frozen. The remaining `TODO(student)` markers are for the student's own words in the AI disclosure
-> (section 7). No `TODO` may remain at submission.
-
 ## Contents
 
 1. [The problem and the algorithm](#1-the-problem-and-the-algorithm)
@@ -718,35 +714,57 @@ patients and three seeds per model:
 
 ## 7. Artificial Intelligence Usage Disclosure
 
-**Tools.** Claude (Anthropic), through the Claude Code desktop application (model Claude Sonnet 5.5).
-**TODO(student)**: add any other AI tool you used and for what (for example translation or summarising).
+**Tools.** Claude (Anthropic), through the Claude Code desktop application (models Claude Sonnet 5 and Claude Sonnet 5.5),
+running on my laptop with access to the project folder and the shell. No other AI tool was used.
 
-**What the AI assisted with.** Reading the assessment specification and proposing a plan; writing the first
-versions of [`dataset.py`](dataset.py), [`modules.py`](modules.py), [`utils.py`](utils.py), [`train.py`](train.py),
-[`predict.py`](predict.py), the Slurm job scripts, the audit, orientation, VRAM and profiling scripts, and all unit
-tests; analysing the numbers and figures of the experiments with me; drafting the commit messages and the text of this
-README. **TODO(student)**: state in your own words what you decided and did yourself (the choice of project, the design
-and protocol decisions, running every job on Rangpur, reading the results), and what you changed.
+**What the AI assisted with.** Reading the assessment specification and proposing a plan; writing the first versions of
+[`dataset.py`](dataset.py), [`modules.py`](modules.py), [`utils.py`](utils.py), [`train.py`](train.py),
+[`predict.py`](predict.py), the Slurm job scripts, the audit, orientation, VRAM, profiling and summary scripts, and all unit
+tests; running the tests and the mutation checks below; analysing the numbers and the figures of the experiments with me and
+proposing the extra analyses that the results called for (the boundary measures, the three seeds, the per-patient view, the
+improved figures); and writing the text of this README and the commit messages. In short, the AI wrote most of the code and
+the text, and I directed, ran and checked the work, as described next.
+
+**How the commit log came about.** The AI assistant ran the git commands on my laptop. It made one commit per step of the work
+(there are about 40 commits, from the data audit of 30 September to the final figures). For every commit it committed and pushed
+only after I had read its summary of the change and told it to ("commit and push"). The commit messages were drafted by the
+assistant. The commits carry the dates on which they were made; nothing was back-dated or rewritten. The two commits by another
+author are the course's initial commits.
+
+**What I did myself.** I chose the project (Segmentation 2.2, the 3D Improved U-Net on the downsampled HipMRI data, Hard
+difficulty) and kept it when I fell behind instead of switching to an easier one. I decided to run everything on Rangpur, after
+considering the other GPU service. I submitted and monitored every job on Rangpur (the audit, the orientation check, the memory
+measurements, the nine training runs and all the predictions), copied the outputs and figures to my laptop and read them. I
+approved the evaluation protocol, including that the test split was to be read only once, after the protocol was frozen. When the
+results raised questions I asked for the analyses that answered them, I contributed my own ideas for how the figures should be
+changed, and I approved every change before it was committed. I checked the requirements of the feasibility check-off with my
+tutor.
 
 **How the AI-written code was audited, verified and tested.**
 
 - 102 unit tests on synthetic data (data pipeline, models, loss and metrics, the training pipeline end to end, the boundary
-  analysis, the result summary), including tests that predict.py and train.py give the same Dice for the same checkpoint.
+  analysis, the result summary), including tests that `predict.py` and `train.py` give the same Dice for the same checkpoint.
 - *Deliberate-breakage checks:* for the models, the loss, the training script and the analysis, bugs were inserted on
   purpose (for example no padding, an ignored skip connection, swapped bladder and rectum, patient-level averaging
-  replaced by volume-level averaging, the test set read during training) and the tests had to fail. This found two
-  weak tests, which were rewritten (a test that did not distinguish a real skip connection from any other input of the
-  concatenation, and a test that did not notice the test split being loaded during training).
+  replaced by volume-level averaging, the test set read during training) and the tests had to fail. This found several weak
+  tests, which were rewritten (for example a test that did not distinguish a real skip connection from any other input of the
+  concatenation, a test that did not notice the test split being loaded during training, and a test that could not tell a
+  dropped rectum error from a bladder error).
 - *Measurements instead of estimates:* an AI estimate that whole volumes would need tens of GB was replaced by a
-  measurement (4.9-6.4 GiB); a claim made from two figures that the base is "read as bladder" was checked against
-  a new measure on all 48 volumes and turned out to hold for only 2.5% of the base voxels on average (the dominant error is
-  a boundary that is too tight, section 6.4); a slow validation step was traced with a profiler to a memory-layout
-  problem instead of guessing.
+  measurement (4.9-6.4 GiB); a claim made from two figures that the base is "read as bladder" was checked against a new
+  measure on all 48 volumes and held for only 2.5% of the base voxels on average (the dominant error is a boundary that is too
+  tight, section 6.4); a slow validation step was traced with a profiler to a memory-layout problem instead of guessing.
+- *Corrections after the results:* the README was corrected where the numbers did not support a first reading, for example the
+  expectation that the Improved U-Net would beat the plain 3D U-Net, the statement that the shares of leakage in one case had
+  the same order as the averages (they did not for the two 3D models), and the favourable verdict on acceptance criterion 2 that
+  one seed suggested (three seeds did not reach it).
+- *Protecting the test split:* it was read only once, after the protocol was frozen; a unit test checks that training without
+  `--test` never loads the test volumes.
 - *Checks against the real data:* the audit, the orientation check, the nine training runs and the predictions were run on
   Rangpur, and the figures were inspected by eye.
-- Limits of this verification: the unit tests ran locally with a different PyTorch version (2.8.0) from the
-  experiments (2.13.0). **TODO(student)**: confirm that you read the code you submit and can explain every equation
-  and design choice.
+- *Limits of this verification:* the unit tests ran locally with a different PyTorch version (2.8.0) from the experiments
+  (2.13.0), and the code review by the teaching team is still to come. I read the code I submit, with the help of a checklist
+  of the equations and design decisions of each file, and I can explain every equation and design choice.
 
 ## 8. References
 
