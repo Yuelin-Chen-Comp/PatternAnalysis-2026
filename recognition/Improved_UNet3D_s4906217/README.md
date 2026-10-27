@@ -338,6 +338,8 @@ Computed by [`predict.py`](predict.py) from the prediction and the ground truth 
 - **Connected components** of the predicted prostate and the share outside the largest one (small disconnected
   artifacts).
 
+## 6. Results
+
 ### 6.1 Training results on the validation split
 
 Nine runs (three models, seeds 0, 1 and 2) on the validation split; the best epoch of each run, chosen on this same
